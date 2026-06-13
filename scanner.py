@@ -1,8 +1,154 @@
 import hashlib
 import logging
+import os
+from collections import Counter
 from pathlib import Path
 
-LARGE_FILE_THRESHOLD = 1 * 1024 ** 3  # 1 GB
+LARGE_PDF_THRESHOLD = 1 * 1024 ** 3  # 1 GB
+
+# Names that, when found as a direct child of a folder, tell us what that
+# folder "is about".  Checked against both file names and subfolder names.
+MARKERS = {
+    ".git", "package.json", "package-lock.json", "yarn.lock",
+    "node_modules", "venv", ".venv", "__pycache__", ".cache",
+    "requirements.txt", "Pipfile", "pyproject.toml",
+    "Cargo.toml", "go.mod", "pom.xml", "build.gradle",
+    "Makefile", "Dockerfile", "docker-compose.yml", ".env",
+}
+
+
+def scan(target: Path) -> tuple[dict[str, dict], dict[str, dict]]:
+    """
+    Walk target and return two inventories:
+      folders  — path_str -> folder descriptor (every subdirectory)
+      pdfs     — path_str -> PDF descriptor   (every .pdf file found)
+
+    Symlinks are never followed.  Permission errors are logged and skipped.
+    PDF content-hashes are computed only for PDFs that share an identical
+    size (the only ones that can be exact duplicates).
+    """
+    log = logging.getLogger(__name__)
+    target = target.resolve()
+
+    folder_inventory: dict[str, dict] = {}
+    pdf_inventory: dict[str, dict] = {}
+
+    def _on_error(exc: OSError) -> None:
+        log.warning("Skipping inaccessible path: %s", exc)
+
+    # topdown=False means we visit deepest directories first.
+    # When we process a parent folder, its children are already in
+    # folder_inventory, so we can add their stats to the parent's totals.
+    for dirpath_str, dirnames, filenames in os.walk(
+        str(target), topdown=False, followlinks=False, onerror=_on_error
+    ):
+        dirpath = Path(dirpath_str)
+
+        # Drop symlinked subdirectories from the traversal list in-place.
+        # os.walk uses this list to decide which dirs to descend into.
+        dirnames[:] = [d for d in dirnames if not (dirpath / d).is_symlink()]
+
+        # ── Accumulate stats for files that live directly in this folder ──
+        direct_size = 0
+        direct_file_count = 0
+        ext_counter: Counter = Counter()
+        max_mtime = 0.0
+        markers_found: set[str] = set()
+
+        for fname in filenames:
+            fpath = dirpath / fname
+            if fpath.is_symlink():
+                continue
+            try:
+                st = fpath.stat()
+            except (PermissionError, OSError) as exc:
+                log.warning("Skipping %s: %s", fpath, exc)
+                continue
+
+            direct_size += st.st_size
+            direct_file_count += 1
+            ext = fpath.suffix.lower()
+            if ext:
+                ext_counter[ext] += 1
+            max_mtime = max(max_mtime, st.st_mtime)
+
+            if fname in MARKERS:
+                markers_found.add(fname)
+
+            # Collect every PDF into its own inventory
+            if ext == ".pdf":
+                pdf_inventory[str(fpath)] = {
+                    "name": fname,
+                    "size_bytes": st.st_size,
+                    "modified_date": st.st_mtime,
+                    "created_date": st.st_ctime,
+                    "content_hash": None,
+                    "is_large": st.st_size > LARGE_PDF_THRESHOLD,
+                }
+
+        # Check direct subdirectory names for markers
+        for dname in dirnames:
+            if dname in MARKERS:
+                markers_found.add(dname)
+
+        # ── Roll up stats from already-processed child directories ──
+        total_size = direct_size
+        total_file_count = direct_file_count
+        total_subfolder_count = len(dirnames)  # start with direct count
+
+        for dname in dirnames:
+            child_key = str(dirpath / dname)
+            child = folder_inventory.get(child_key)
+            if child is None:
+                continue  # inaccessible child — was skipped
+            total_size += child["total_size"]
+            total_file_count += child["file_count"]
+            total_subfolder_count += child["subfolder_count"]
+            ext_counter.update(child["_ext_counter"])
+            max_mtime = max(max_mtime, child["last_modified"])
+
+        # Depth 0 = target itself; depth 1 = its immediate children; etc.
+        try:
+            depth = len(dirpath.relative_to(target).parts)
+        except ValueError:
+            depth = 0
+
+        folder_inventory[str(dirpath)] = {
+            "name": dirpath.name if dirpath.name else str(dirpath),
+            "path": str(dirpath),
+            "depth": depth,
+            "total_size": total_size,
+            "file_count": total_file_count,
+            "subfolder_count": total_subfolder_count,
+            "last_modified": max_mtime,
+            "dominant_file_types": dict(ext_counter.most_common(5)),
+            "markers": sorted(markers_found),
+            # Internal field used only during this walk so parents can
+            # inherit children's extension counts.  Stripped before return.
+            "_ext_counter": ext_counter,
+        }
+
+    # ── Remove the internal field now that the walk is complete ──
+    for entry in folder_inventory.values():
+        entry.pop("_ext_counter", None)
+
+    # ── Hash only PDFs that share an identical size ──
+    # Files with unique sizes cannot be duplicates, so hashing them is wasteful.
+    size_groups: dict[int, list[str]] = {}
+    for path_str, meta in pdf_inventory.items():
+        if not meta["is_large"]:
+            size_groups.setdefault(meta["size_bytes"], []).append(path_str)
+
+    for paths in size_groups.values():
+        if len(paths) < 2:
+            continue
+        for path_str in paths:
+            try:
+                pdf_inventory[path_str]["content_hash"] = _hash_file(Path(path_str))
+            except (PermissionError, OSError) as exc:
+                log.warning("Could not hash %s: %s", path_str, exc)
+
+    return folder_inventory, pdf_inventory
 
 
 def _hash_file(path: Path) -> str:
@@ -11,55 +157,3 @@ def _hash_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def scan(target: Path) -> dict[str, dict]:
-    """
-    Walk target directory and return metadata keyed by absolute path string.
-    Large files (>1 GB) are flagged but not hashed. Duplicates are detected
-    by hashing only files that share an identical size.
-    """
-    log = logging.getLogger(__name__)
-    results: dict[str, dict] = {}
-
-    # First pass: collect metadata for every file
-    size_groups: dict[int, list[str]] = {}  # size_bytes -> [path_str, ...]
-
-    for path in target.rglob("*"):
-        if not path.is_file() or path.is_symlink():
-            continue
-
-        try:
-            stat = path.stat()
-        except PermissionError:
-            log.warning("Permission denied, skipping: %s", path)
-            continue
-
-        size = stat.st_size
-        entry = {
-            "name": path.name,
-            "extension": path.suffix.lower(),
-            "size_bytes": size,
-            "modified_date": stat.st_mtime,
-            "accessed_date": stat.st_atime,
-            "created_date": stat.st_ctime,
-            "content_hash": None,
-            "is_large": size > LARGE_FILE_THRESHOLD,
-        }
-        path_str = str(path.resolve())
-        results[path_str] = entry
-
-        if not entry["is_large"]:
-            size_groups.setdefault(size, []).append(path_str)
-
-    # Second pass: hash only files that share a size (duplicate candidates)
-    for size, paths in size_groups.items():
-        if len(paths) < 2:
-            continue
-        for path_str in paths:
-            try:
-                results[path_str]["content_hash"] = _hash_file(Path(path_str))
-            except (PermissionError, OSError) as exc:
-                log.warning("Could not hash %s: %s", path_str, exc)
-
-    return results

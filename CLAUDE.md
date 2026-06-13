@@ -1,102 +1,174 @@
-# Project: AI File Declutter Tool
+Project: AI File & Folder Declutter Tool
 
-A CLI tool that scans a directory, classifies files as garbage/keep/uncertain/large
-using deterministic rules first and an LLM only for ambiguous cases, then
-moves approved garbage to a quarantine folder (never hard-deletes).
+A CLI tool that scans a directory and identifies disposable items. It evaluates
+folders as the primary unit (most reclaimable space lives in folders), plus
+loose PDF files, using deterministic rules first and an LLM only for genuinely
+ambiguous folders. The LLM is an advisor: it writes reasoning for a human,
+it never deletes anything. The human makes every non-rule decision through a
+review UI. Confirmed items go to the Recycle Bin (reversible), never hard-deleted.
 
-## Principles (do not violate)
-- NEVER delete files. Move to a `_quarantine/` folder; deletion is reversible.
-- Dry-run is the DEFAULT. Real moves require an explicit `--apply` flag.
-- The LLM is called ONLY for files no rule could decide. Rules are cheap and trusted.
-- Rules are decisive single conditions, NOT additive scores. Match → classify; no match → unknown.
-- The model must return structured output validated by pydantic. Never trust raw JSON.
-- Every run is logged to a timestamped log file (see Logging).
+Principles (do not violate)
 
-## Stack
+
+NEVER hard-delete. Send items to the OS Recycle Bin via send2trash (reversible).
+Dry-run is the DEFAULT. Real deletion requires explicit human confirmation in the review UI.
+The LLM NEVER deletes and NEVER auto-classifies as garbage. It only produces a
+recommendation + written reasoning for a human. Everything the AI touches goes to human review.
+The ONLY items deleted automatically are deterministic-rule hits (e.g. empty folders,
+recognizable regenerable folders). These are trusted; the AI's are not.
+Rules are decisive single conditions, NOT additive scores. Match → classify; no match → unknown.
+The model must return structured output validated by pydantic. Never trust raw JSON.
+Every run is logged to a timestamped log file (see Logging).
+
+
+Stack
+
 Python 3.11+ managed via uv.
-Third-party deps (via `uv add`): rich, pydantic, google-genai, python-dotenv.
-Standard library (built-in, no install): pathlib, hashlib, logging.
+Third-party deps (via uv add): rich, pydantic, google-genai, python-dotenv, send2trash, flask, questionary.
+Standard library (built-in, no install): pathlib, hashlib, logging, os.
 
-## Setup & Run (uv)
+Setup & Run (uv)
+
 Install deps:
-    uv add rich pydantic google-genai python-dotenv
+uv add rich pydantic google-genai python-dotenv send2trash flask questionary
 
-Run (dry-run is default):
-    uv run python main.py scanner.py
+Run (opens Flask review UI by default; nothing is deleted without confirmation):
+uv run python main.py <target_directory>
 
-Apply real moves:
-    uv run python main.py scanner.py --apply
+Terminal-only fallback (no web UI):
+uv run python main.py <target_directory> --no-ui
 
 Run the eval:
-    uv run python eval/run_eval.py
+uv run python eval/run_eval.py
 
-## Stage 1 — Scanner (scanner.py)
-Walk a directory with pathlib.
-Skip symlinks. Skip files that raise permission errors (log and continue).
+Stage 1 — Scanner (scanner.py)
+
+Walk the target directory with pathlib.
+Skip symlinks. Skip files/folders that raise permission errors (log and continue).
 Don't follow links out of the target directory.
-For each file collect into a dict  keyed by file path:
-name, extension, size_bytes, modified_date, accessed_date, created_date.
-Files larger than 1 GB are flagged "large" here and are NOT hashed and NOT
-sent to the rules or AI (they only appear in review).
-Do NOT hash every file. After the walk, among files <= 1 GB, group by identical
-size and compute content-hash (hashlib) ONLY for files sharing a size — these
+
+Collect TWO inventories:
+
+
+Folders — for each folder, a descriptor keyed by folder path:
+name, full path, depth, total size (sum of contained files), file count,
+subfolder count, last-modified date, dominant file types inside (extensions
+seen and rough counts), notable markers (presence of .git, package.json,
+node_modules, venv, etc.).
+Loose PDF files — for each .pdf, a descriptor keyed by file path:
+name, size_bytes, modified_date, created_date. PDFs larger than 1 GB are
+flagged "large" and are NOT hashed.
+Do NOT hash every PDF. After the walk, among PDFs <= 1 GB, group by identical
+size and compute content-hash (hashlib) ONLY for PDFs sharing a size — these
 are the only possible duplicates.
 
-## Stage 2 — Rules layer (rules.py)
-Apply decisive deterministic rules to files NOT already flagged "large".
-Each rule either classifies confidently or stays silent. No scoring, no
-thresholds. If no rule fires → "unknown".
 
-Garbage rules (high confidence only):
-- exact duplicate (same size AND same hash) — keep the OLDEST copy by creation
-  date, the rest are garbage
-- zero-byte files
-- temp/cache extensions in temp/cache locations (.tmp, .log, .crdownload, .part)
-- known installer files (.exe, .msi) older than ~6 months in Downloads
+Non-PDF loose files are NOT evaluated individually; they only matter as part of
+their containing folder's roll-up.
 
-Keep rules (protect from AI and from deletion):
-- files modified within the last 14 days — EXCEPT PDFs (see PDF rule)
-- documents/source/keys (.docx, .xlsx, .py, .key, .pem, etc.) — EXCEPT PDFs
-- anything in a system or program directory (out of scope — skip entirely)
+Stage 2 — Rules layer (rules.py)
 
-PDF rule (overrides the keep rules above):
-- A .pdf file is NEVER classified as "keep".
-- A .pdf is "garbage" ONLY if it is an exact duplicate (same size AND same hash);
-  keep the oldest copy, the rest are garbage.
-- Every other .pdf → "unknown" (passed to Stage 3), regardless of age or location.
+Apply decisive deterministic rules. Each rule either classifies confidently or
+stays silent. No scoring, no thresholds. Process bottom-up (deepest folders first)
+so a parent's verdict can use its children's.
 
-Everything else not caught by a rule → "unknown", passed to Stage 3.
+Folder garbage rules (auto-delete, high confidence only):
 
-## Stage 3 — AI triage (triage.py)
-Send ONLY the "unknown" files (never "large", "keep", or rule-decided garbage).
-Batch ~50 metadata descriptors per Gemini API call (use Gemini 2.5 Flash).
-Per file the model returns, validated by a pydantic model:
-{ verdict: "garbage" | "keep" | "uncertain", confidence: float, reason: str }
-Wrap each batch call in try/except: on failure, retry once, then mark that
-batch's files as "uncertain" and continue. Never let one failed batch crash the run.
-Store results in a dict keyed by file path.
 
-## Stage 4 — Review (review.py)
-Merge rule results + AI results + large files. Print a rich table:
-columns = filename, size, verdict, confidence, reason.
-Sort by verdict (garbage → uncertain → large → keep). Show a summary line:
-total reclaimable space from garbage, and total space held by large files.
+empty folder (no files, no subfolders)
+recognizable regenerable folders by exact name: node_modules, pycache,
+.cache, venv, .venv, build/dist output dirs
+a folder whose every contained item is already classified garbage (and no
+kept subfolders) → the whole folder is garbage; delete as a unit
 
-## Stage 5 — Safe action (actions.py)
-Default (no flag): dry-run — print what WOULD move, change nothing.
-With --apply: move ONLY "garbage" files into _quarantine/ (preserve relative
-paths so undo is possible). NEVER touch "keep", "uncertain", or "large" files.
-Print an undo hint.
 
-## Logging
+Folder keep / out-of-scope rules:
+
+
+anything in a system or program directory (out of scope — skip entirely)
+a folder containing ANY kept item is kept (one important file protects the folder)
+
+
+Folders not caught by a rule → "unknown", passed to Stage 3 (AI advice).
+
+PDF rule:
+
+
+A .pdf is NEVER auto-classified as "keep".
+A .pdf is "garbage" (auto, rule-based) ONLY if it is an exact duplicate
+(same size AND same hash); keep the oldest copy, the rest are garbage.
+Every other .pdf → "unknown", passed to Stage 3 (AI advice).
+
+
+Stage 3 — AI advice (triage.py)
+
+Send ONLY the "unknown" folders and "unknown" PDFs (never rule-decided items,
+never "large" items). Batch ~50 descriptors per Gemini API call (Gemini 2.5 Flash).
+
+For folders, the descriptor leads with the NAME (the highest-value signal when
+legible — node_modules, venv, etc.), and ALWAYS includes metadata to disambiguate
+when the name is opaque (stuff, new folder (2), backup_final): size, last-modified,
+file count, dominant file types, and markers (.git/package.json/etc.). Name first
+when legible; metadata to disambiguate when it isn't.
+
+Per item the model returns, validated by a pydantic model:
+{ recommendation: "likely_garbage" | "likely_keep", confidence: float, reason: str }
+NOTE: there is no "delete" verdict — the model only advises. Every AI-evaluated
+item goes to human review regardless of recommendation.
+
+Wrap each batch call in try/except: on failure, retry once, then mark that batch's
+items as "needs_review" with a note that AI advice was unavailable, and continue.
+Never let one failed batch crash the run. Store results keyed by path.
+
+Stage 4 — Review (review.py)
+
+Produce the review data: two groups.
+
+Group A — Confirmed garbage (rule-based, will be deleted on confirm):
+auto-deleted folders and duplicate PDFs.
+
+Group B — Needs human decision (AI-advised + AI-unavailable items):
+each row shows name, size, AI recommendation, confidence, and the AI's reasoning.
+
+Render both as rich tables for reading (always printed). Show a summary line:
+total reclaimable space from Group A, and potential space from Group B.
+
+Stage 5 — Action UI (ui_web.py + actions.py)
+
+Default: Flask local web UI (served on localhost) is the primary review interface.
+
+
+Renders Group A and Group B as HTML tables (same data as the rich tables).
+Group B rows each have: a select/checkbox to mark for deletion, and a
+"See directory" button.
+"See directory" hits a Flask endpoint that runs os.startfile(path) SERVER-SIDE,
+opening the folder in the OS file manager. This works only because the server
+is the user's own local machine.
+A "Confirm deletion" button sends all of Group A plus the user-selected Group B
+items to deletion.
+
+
+Fallback (--no-ui): a terminal review using questionary — show the rich tables,
+then a checkbox prompt over Group B for the user to arrow/space-select items.
+
+Deletion (actions.py): all confirmed items are sent to the OS Recycle Bin via
+send2trash (reversible). Folders are sent as a whole unit. NEVER hard-delete.
+Nothing is deleted until the human confirms in the UI. Log every deleted path.
+
+Logging
+
 Every run writes a timestamped log file to logs/run_YYYYMMDD_HHMMSS.log.
-Record: target directory, flags used (dry-run vs --apply), counts per verdict,
-skipped files (symlinks, permission errors), every batch API failure/retry,
-and in --apply mode the exact source→quarantine path of every moved file
-(this is what makes undo possible). Use Python's logging module.
+Record: target directory, rule-based (Group A) items, AI recommendations and
+which items went to human review (Group B), skipped items (symlinks, permission
+errors), every batch API failure/retry, and the exact path of every item the
+human confirmed for deletion. Use Python's logging module.
 
-## Eval (eval/)
-A fixture folder of ~30 labeled files (known correct verdict each). A script
-that runs the pipeline against it and reports precision on garbage calls —
-the key metric is: we never flag a "keep" file as garbage (zero false positives
-on deletion). Report this number in the README.
+Eval (eval/)
+
+A fixture tree of ~30 labeled folders and PDFs (known correct disposition each).
+A script that runs the pipeline against it and reports precision on the
+rule-based auto-delete decisions (Group A) — the key metric is: the deterministic
+rules NEVER auto-delete something that should be kept (zero false positives on
+auto-deletion). AI recommendations can also be scored against the labels, but
+they are advisory and not held to the zero-false-positive bar since a human
+gates them. Report these numbers in the README.
