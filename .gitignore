@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Garbage-Cleaner runtime folders
+_quarantine/
+logs/
