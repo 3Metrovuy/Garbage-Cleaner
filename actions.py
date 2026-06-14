@@ -1,83 +1,48 @@
 import logging
-import shutil
 from pathlib import Path
 
 from rich.console import Console
+from send2trash import send2trash
 
 
-def run_actions(rows: list[dict], target: Path, apply: bool) -> None:
+def run_actions(confirmed: list[dict], dry_run: bool = True) -> None:
     """
-    Dry-run (apply=False): print what would move, change nothing.
-    Apply (apply=True): move all 'garbage' files into a flat _quarantine/
-    folder that sits next to the scan target (not inside it).
+    Send all confirmed items to the OS Recycle Bin via send2trash (reversible).
+    dry_run=True (default): print what would be recycled, change nothing.
+    dry_run=False: move each item to the Recycle Bin and log every path.
+    Folders are sent as whole units; send2trash handles both files and dirs.
     """
     log = logging.getLogger(__name__)
     console = Console()
 
-    garbage = [r for r in rows if r["verdict"] == "garbage"]
-
-    if not garbage:
-        console.print("[green]No garbage files found — nothing to move.[/green]")
+    if not confirmed:
+        console.print("[green]Nothing confirmed for deletion.[/green]")
         return
 
-    # Quarantine sits beside the target, not inside it, so it is never scanned
-    # on subsequent runs.
-    quarantine_root = target.parent / "_quarantine"
-
-    if not apply:
+    if dry_run:
         console.print(
-            f"[bold]Dry-run:[/bold] {len(garbage)} file(s) would move to "
-            f"[cyan]{quarantine_root}[/cyan]  (pass --apply to execute)\n"
+            f"[bold]Dry-run:[/bold] {len(confirmed)} item(s) would be sent to the Recycle Bin.\n"
         )
-        for r in garbage:
-            src = Path(r["path"])
-            dest = _flat_dest(src, quarantine_root)
-            console.print(f"  [dim]would move[/dim]  {src}  [dim]→[/dim]  {dest}")
+        for item in confirmed:
+            console.print(f"  [dim]would recycle[/dim]  {item['path']}")
         return
 
-    # --- apply mode ---
-    quarantine_root.mkdir(parents=True, exist_ok=True)
-    console.print(
-        f"[bold]Quarantining {len(garbage)} garbage file(s) → "
-        f"[cyan]{quarantine_root}[/cyan][/bold]\n"
-    )
-    moved = 0
-    for r in garbage:
-        src = Path(r["path"])
-        dest = _flat_dest(src, quarantine_root)
+    console.print(f"[bold]Sending {len(confirmed)} item(s) to Recycle Bin...[/bold]\n")
+    recycled = 0
+    for item in confirmed:
+        path = Path(item["path"])
+        if not path.exists():
+            log.warning("SKIP (not found): %s", path)
+            console.print(f"  [yellow]skip[/yellow]   {path.name}  [dim](not found)[/dim]")
+            continue
         try:
-            shutil.move(str(src), str(dest))
-            log.info("MOVED  %s  ->  %s", src, dest)
-            console.print(f"  [red]moved[/red]  {src.name}  [dim]→[/dim]  {dest}")
-            moved += 1
-        except FileNotFoundError:
-            log.warning("Source not found (already moved?): %s", src)
-            console.print(f"  [yellow]skip[/yellow]   {src.name}  [dim](not found)[/dim]")
-        except OSError as exc:
-            log.error("Failed to move %s: %s", src, exc)
-            console.print(f"  [red]error[/red]  {src.name}  [dim]{exc}[/dim]")
+            send2trash(str(path))
+            log.info("RECYCLED  %s", path)
+            console.print(f"  [red]recycled[/red]  {path}")
+            recycled += 1
+        except Exception as exc:
+            log.error("FAILED to recycle %s: %s", path, exc)
+            console.print(f"  [red]error[/red]   {path.name}  [dim]{exc}[/dim]")
 
-    console.print(
-        f"\n[bold green]{moved}/{len(garbage)} file(s) quarantined.[/bold green]\n"
-        f"[dim]Undo: move files from {quarantine_root} back to their original paths.\n"
-        f"Original paths for every file are recorded in the run log.[/dim]"
-    )
-
-
-def _flat_dest(src: Path, quarantine_root: Path) -> Path:
-    """
-    Place src flat inside quarantine_root using only its filename.
-    If a file with that name already exists, append _1, _2, ... to the stem
-    until a free slot is found.
-    """
-    name = src.name
-    dest = quarantine_root / name
-    if not dest.exists():
-        return dest
-
-    stem, suffix = src.stem, src.suffix
-    counter = 1
-    while dest.exists():
-        dest = quarantine_root / f"{stem}_{counter}{suffix}"
-        counter += 1
-    return dest
+    console.print(f"\n[bold green]{recycled}/{len(confirmed)} item(s) sent to Recycle Bin.[/bold green]")
+    console.print("[dim]Undo: restore items from the Recycle Bin.[/dim]")

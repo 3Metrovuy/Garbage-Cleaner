@@ -2,8 +2,8 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
-VERDICT_ORDER = {"garbage": 0, "uncertain": 1, "large": 2, "keep": 3}
-VERDICT_STYLE = {"garbage": "red", "uncertain": "yellow", "large": "cyan", "keep": "green"}
+_REC_ORDER = {"likely_garbage": 0, "needs_review": 1, "likely_keep": 2}
+_REC_STYLE = {"likely_garbage": "red", "likely_keep": "green", "needs_review": "yellow"}
 
 
 def _fmt_size(size_bytes: int) -> str:
@@ -15,94 +15,129 @@ def _fmt_size(size_bytes: int) -> str:
 
 
 def build_report(
-    scan_results: dict[str, dict],
-    rule_verdicts: dict[str, str],
+    folder_inventory: dict[str, dict],
+    pdf_inventory: dict[str, dict],
+    folder_verdicts: dict[str, str],
+    pdf_verdicts: dict[str, str],
     ai_results: dict[str, dict],
-) -> list[dict]:
+) -> tuple[list[dict], list[dict]]:
     """
-    Merge scan metadata, rule verdicts, and AI triage results into a flat list
-    of report rows, sorted by verdict severity (garbage first, keep last).
-    'skip' entries (system dirs) are excluded from the report entirely.
+    Merge inventories, rule verdicts, and AI results into two groups.
+
+    Group A — rule-confirmed garbage (auto-deleted on confirm).
+    Group B — AI-advised or AI-unavailable items requiring human decision.
+
+    Returns (group_a, group_b).
     """
-    rows: list[dict] = []
+    group_a: list[dict] = []
+    group_b: list[dict] = []
 
-    for path_str, meta in scan_results.items():
-        rule_v = rule_verdicts.get(path_str)
-
-        if rule_v == "skip":
+    for path_str, meta in folder_inventory.items():
+        verdict = folder_verdicts.get(path_str)
+        if verdict in (None, "skip", "keep"):
             continue
-
-        if rule_v == "large":
-            rows.append({
+        size = meta["total_size"]
+        if verdict == "garbage":
+            group_a.append({
                 "path": path_str,
                 "name": meta["name"],
-                "size_bytes": meta["size_bytes"],
-                "verdict": "large",
-                "confidence": None,
-                "reason": "file exceeds 1 GB threshold",
-            })
-
-        elif rule_v in ("garbage", "keep"):
-            rows.append({
-                "path": path_str,
-                "name": meta["name"],
-                "size_bytes": meta["size_bytes"],
-                "verdict": rule_v,
-                "confidence": 1.0,
+                "size_bytes": size,
+                "type": "folder",
                 "reason": "deterministic rule",
             })
-
-        else:
-            # rule_v == "unknown" — use AI result, fall back to uncertain
+        else:  # unknown
             ai = ai_results.get(path_str, {})
-            rows.append({
+            group_b.append({
                 "path": path_str,
                 "name": meta["name"],
-                "size_bytes": meta["size_bytes"],
-                "verdict": ai.get("verdict", "uncertain"),
+                "size_bytes": size,
+                "type": "folder",
+                "recommendation": ai.get("recommendation", "needs_review"),
                 "confidence": ai.get("confidence"),
                 "reason": ai.get("reason", ""),
             })
 
-    rows.sort(key=lambda r: VERDICT_ORDER.get(r["verdict"], 99))
-    return rows
+    for path_str, meta in pdf_inventory.items():
+        verdict = pdf_verdicts.get(path_str)
+        size = meta["size_bytes"]
+        if verdict == "garbage":
+            group_a.append({
+                "path": path_str,
+                "name": meta["name"],
+                "size_bytes": size,
+                "type": "pdf",
+                "reason": "exact duplicate",
+            })
+        elif verdict == "large":
+            group_b.append({
+                "path": path_str,
+                "name": meta["name"],
+                "size_bytes": size,
+                "type": "pdf",
+                "recommendation": "needs_review",
+                "confidence": None,
+                "reason": "file exceeds 1 GB — not evaluated",
+            })
+        elif verdict == "unknown":
+            ai = ai_results.get(path_str, {})
+            group_b.append({
+                "path": path_str,
+                "name": meta["name"],
+                "size_bytes": size,
+                "type": "pdf",
+                "recommendation": ai.get("recommendation", "needs_review"),
+                "confidence": ai.get("confidence"),
+                "reason": ai.get("reason", ""),
+            })
+
+    group_a.sort(key=lambda r: r["size_bytes"], reverse=True)
+    group_b.sort(key=lambda r: _REC_ORDER.get(r["recommendation"], 99))
+
+    return group_a, group_b
 
 
-def display(rows: list[dict]) -> None:
-    """Print the verdict table and a one-line summary to stdout."""
+def display(group_a: list[dict], group_b: list[dict]) -> None:
+    """Print Group A and Group B as rich tables plus a one-line summary."""
     console = Console()
 
-    table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
-    table.add_column("Filename", max_width=45)
-    table.add_column("Size", justify="right")
-    table.add_column("Verdict", justify="center")
-    table.add_column("Conf", justify="right")
-    table.add_column("Reason")
+    console.print("\n[bold red]Group A — Confirmed Garbage (rule-based)[/bold red]")
+    if group_a:
+        tbl = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+        tbl.add_column("Type", width=6)
+        tbl.add_column("Name", max_width=45)
+        tbl.add_column("Size", justify="right")
+        tbl.add_column("Rule")
+        for r in group_a:
+            tbl.add_row(r["type"], r["name"], _fmt_size(r["size_bytes"]), r["reason"], style="red")
+        console.print(tbl)
+    else:
+        console.print("  [dim]None[/dim]\n")
 
-    for r in rows:
-        conf = f"{r['confidence']:.0%}" if r["confidence"] is not None else "—"
-        table.add_row(
-            r["name"],
-            _fmt_size(r["size_bytes"]),
-            r["verdict"],
-            conf,
-            r["reason"] or "",
-            style=VERDICT_STYLE.get(r["verdict"], ""),
-        )
+    console.print("[bold yellow]Group B — Needs Human Decision (AI-advised)[/bold yellow]")
+    if group_b:
+        tbl = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+        tbl.add_column("Type", width=6)
+        tbl.add_column("Name", max_width=40)
+        tbl.add_column("Size", justify="right")
+        tbl.add_column("AI Recommendation", justify="center")
+        tbl.add_column("Conf", justify="right")
+        tbl.add_column("Reason")
+        for r in group_b:
+            rec = r["recommendation"]
+            conf = f"{r['confidence']:.0%}" if r["confidence"] is not None else "—"
+            tbl.add_row(
+                r["type"], r["name"], _fmt_size(r["size_bytes"]),
+                rec, conf, r["reason"] or "",
+                style=_REC_STYLE.get(rec, ""),
+            )
+        console.print(tbl)
+    else:
+        console.print("  [dim]None[/dim]\n")
 
-    console.print(table)
-
-    # Summary counts and sizes
-    garbage_bytes = sum(r["size_bytes"] for r in rows if r["verdict"] == "garbage")
-    large_bytes = sum(r["size_bytes"] for r in rows if r["verdict"] == "large")
-    counts: dict[str, int] = {}
-    for r in rows:
-        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
-
+    a_bytes = sum(r["size_bytes"] for r in group_a)
+    b_bytes = sum(r["size_bytes"] for r in group_b)
     console.print(
         f"[bold]Summary:[/bold]  "
-        f"[red]{counts.get('garbage', 0)} garbage[/red] ([red]{_fmt_size(garbage_bytes)}[/red] reclaimable)  "
-        f"[yellow]{counts.get('uncertain', 0)} uncertain[/yellow]  "
-        f"[cyan]{counts.get('large', 0)} large[/cyan] ([cyan]{_fmt_size(large_bytes)}[/cyan])  "
-        f"[green]{counts.get('keep', 0)} keep[/green]"
+        f"[red]Group A: {len(group_a)} items — {_fmt_size(a_bytes)} reclaimable[/red]  |  "
+        f"[yellow]Group B: {len(group_b)} items — {_fmt_size(b_bytes)} potential[/yellow]"
     )
