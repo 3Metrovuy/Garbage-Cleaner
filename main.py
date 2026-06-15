@@ -63,6 +63,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="AI File & Folder Declutter Tool")
     parser.add_argument("target", type=Path, help="Directory to scan")
     parser.add_argument("--no-ui", action="store_true", help="Terminal-only mode (no Flask web UI)")
+    parser.add_argument("--dry-run", action="store_true", help="Print report and exit without opening UI or deleting")
     args = parser.parse_args()
 
     log_file = _setup_logging()
@@ -114,26 +115,51 @@ def main() -> None:
 
     display(group_a, group_b)
 
-    # Stage 5 — UI (selection + confirmation)
+    # Stage 5 — UI + deletion
     if args.no_ui:
+        if args.dry_run:
+            print(f"\n[dry-run] Would recycle {len(group_a)} Group A item(s):")
+            for item in group_a:
+                print(f"  {item['path']}")
+            print(f"[dry-run] {len(group_b)} Group B item(s) would go to human review.")
+            print("[dry-run] Exiting — nothing deleted.")
+            return
         confirmed = _terminal_ui(group_a, group_b)
-    else:
-        try:
-            from ui_web import launch
-        except ImportError:
-            print("ui_web.py not found — falling back to terminal UI.")
-            log.warning("ui_web not available — using terminal UI")
-            confirmed = _terminal_ui(group_a, group_b)
+        if confirmed:
+            for item in confirmed:
+                log.info("CONFIRMED FOR DELETION: %s", item["path"])
+            run_actions(confirmed, dry_run=False)
         else:
-            confirmed = launch(group_a, group_b)
+            print("No items confirmed — nothing deleted.")
+        return
 
-    # Stage 6 — Delete
-    if confirmed:
-        for item in confirmed:
-            log.info("CONFIRMED FOR DELETION: %s", item["path"])
-        run_actions(confirmed, dry_run=False)
-    else:
-        print("No items confirmed — nothing deleted.")
+    try:
+        from ui_web import launch
+    except ImportError:
+        print("ui_web.py not found — falling back to terminal UI.")
+        log.warning("ui_web not available — using terminal UI")
+        confirmed = _terminal_ui(group_a, group_b)
+        if confirmed:
+            for item in confirmed:
+                log.info("CONFIRMED FOR DELETION: %s", item["path"])
+            run_actions(confirmed, dry_run=False)
+        return
+
+    if args.dry_run:
+        # Preview mode: show full report in browser, delete nothing
+        print("Opening dry-run preview in browser — nothing will be deleted.")
+        launch(group_a, group_b, preview=True)
+        return
+
+    # Regular web mode: auto-recycle Group A now, then open UI for Group B
+    if group_a:
+        print(f"Recycling {len(group_a)} rule-confirmed item(s) ...")
+        for item in group_a:
+            log.info("AUTO-RECYCLED GROUP A: %s", item["path"])
+        run_actions(group_a, dry_run=False)
+
+    launch(group_a, group_b, preview=False)
+    # Group B deletions happen per-row inside the web UI server
 
 
 if __name__ == "__main__":

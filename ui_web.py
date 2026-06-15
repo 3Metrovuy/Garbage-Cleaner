@@ -1,3 +1,4 @@
+import logging
 import os
 import threading
 import time
@@ -6,13 +7,15 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request
 
+_log = logging.getLogger(__name__)
+
 # ── HTML template ─────────────────────────────────────────────────────────────
 
 _HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Garbage Cleaner — Review</title>
+<title>Garbage Cleaner — {% if preview %}Preview{% else %}Review{% endif %}</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -26,6 +29,17 @@ h2 { font-size: 1.05em; font-weight: 600; padding-bottom: 6px;
 .group-a h2 { color: #ff6b6b; }
 .group-b h2 { color: #ffd93d; }
 .group-a, .group-b { margin-bottom: 32px; }
+
+.banner {
+  border-radius: 6px; padding: 12px 18px; margin-bottom: 20px;
+  font-size: 0.95em; font-weight: 600;
+}
+.banner-preview {
+  background: #1a1a00; border: 1px solid #4a4a00; color: #ffd93d;
+}
+.banner-recycled {
+  background: #001a00; border: 1px solid #004a00; color: #6bffb0;
+}
 
 .summary {
   display: flex; gap: 24px; flex-wrap: wrap;
@@ -45,6 +59,7 @@ th {
 }
 td { padding: 6px 10px; border-bottom: 1px solid #1a1a1a; vertical-align: top; }
 tr:hover td { background: #161616; }
+tr.deleted td { opacity: 0.35; text-decoration: line-through; }
 
 .t-type { color: #666; font-size: 0.82em; white-space: nowrap; }
 .t-name { font-weight: 500; color: #eee; }
@@ -57,8 +72,6 @@ tr:hover td { background: #161616; }
 .rec-likely_keep    { color: #6bffb0; }
 .rec-needs_review   { color: #ffd93d; }
 
-input[type=checkbox] { width: 15px; height: 15px; cursor: pointer; accent-color: #ff6b6b; }
-
 .btn {
   border: none; border-radius: 4px; cursor: pointer;
   font-size: 0.88em; padding: 5px 12px;
@@ -68,43 +81,40 @@ input[type=checkbox] { width: 15px; height: 15px; cursor: pointer; accent-color:
   transition: background 0.15s;
 }
 .btn-open:hover { background: #2a2a5a; }
-
-.toolbar {
-  display: flex; align-items: center; gap: 10px;
-  margin-bottom: 10px; font-size: 0.88em; color: #777;
+.btn-delete {
+  background: #3a0000; color: #ff6b6b;
+  transition: background 0.15s; margin-right: 4px;
 }
-.toolbar label { cursor: pointer; display: flex; align-items: center; gap: 6px; }
+.btn-delete:hover { background: #600000; }
+.btn-delete:disabled { background: #1a3a1a; color: #6bffb0; cursor: default; }
 
 .actions {
   display: flex; align-items: center; gap: 12px;
   padding: 16px 0; margin-top: 8px;
   border-top: 1px solid #1e1e1e;
 }
-.btn-confirm {
-  background: #8b0000; color: #fff;
-  padding: 9px 28px; font-size: 1em; font-weight: 600;
+.btn-close {
+  background: #222; color: #aaa;
+  padding: 9px 24px; font-size: 1em;
   transition: background 0.15s;
 }
-.btn-confirm:hover { background: #b00000; }
-.btn-cancel {
-  background: #222; color: #888;
-  padding: 9px 20px; font-size: 1em;
-  transition: background 0.15s;
-}
-.btn-cancel:hover { background: #2e2e2e; }
+.btn-close:hover { background: #2e2e2e; }
 #status { margin-left: auto; color: #777; font-size: 0.9em; }
-
-#done-msg {
-  display: none; padding: 28px; border-radius: 8px;
-  text-align: center; font-size: 1.05em; line-height: 1.6;
-}
-.done-confirmed { background: #0a1f0a; border: 1px solid #1a4a1a; color: #6bffb0; }
-.done-cancelled { background: #1a1a1a; border: 1px solid #2a2a2a; color: #666; }
 </style>
 </head>
 <body>
 
-<h1>Garbage Cleaner — Review</h1>
+<h1>Garbage Cleaner — {% if preview %}Dry Run Preview{% else %}Review{% endif %}</h1>
+
+{% if preview %}
+<div class="banner banner-preview">
+  DRY RUN — nothing will be deleted. This is a read-only preview of what would happen.
+</div>
+{% else %}
+<div class="banner banner-recycled">
+  Group A: {{ group_a | length }} item(s) ({{ group_a | sum(attribute="size_bytes") | fmt_size }}) already sent to Recycle Bin.
+</div>
+{% endif %}
 
 <div class="summary">
   <div class="seg-a">
@@ -118,118 +128,93 @@ input[type=checkbox] { width: 15px; height: 15px; cursor: pointer; accent-color:
   </div>
 </div>
 
-<div id="main-ui">
-
-  <!-- ── Group A ─────────────────────────────────────────────────── -->
-  <div class="group-a">
-    <h2>Group A — Confirmed Garbage (rule-based, always deleted on confirm)</h2>
-    {% if group_a %}
-    <table>
-      <thead>
-        <tr>
-          <th class="t-type">Type</th>
-          <th>Name</th>
-          <th class="t-size">Size</th>
-          <th>Rule</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for r in group_a %}
-        <tr>
-          <td class="t-type">{{ r.type }}</td>
-          <td class="t-name">{{ r.name }}</td>
-          <td class="t-size">{{ r.size_bytes | fmt_size }}</td>
-          <td class="t-reason">{{ r.reason }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% else %}
-    <p style="color:#444; padding: 8px 0;">None</p>
-    {% endif %}
-  </div>
-
-  <!-- ── Group B ─────────────────────────────────────────────────── -->
-  <div class="group-b">
-    <h2>Group B — Needs Human Decision (AI-advised)</h2>
-    {% if group_b %}
-    <div class="toolbar">
-      <label>
-        <input type="checkbox" id="select-all"> Select all
-      </label>
-      <span style="color:#3a3a3a">|</span>
-      <label>
-        <input type="checkbox" id="select-garbage"> Auto-select likely_garbage
-      </label>
-    </div>
-    <table>
-      <thead>
-        <tr>
-          <th></th>
-          <th class="t-type">Type</th>
-          <th>Name</th>
-          <th class="t-size">Size</th>
-          <th>AI Recommendation</th>
-          <th class="t-conf">Conf</th>
-          <th>Reason</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for r in group_b %}
-        <tr>
-          <td><input type="checkbox" class="row-check" data-path="{{ r.path }}"
-            data-rec="{{ r.recommendation }}"></td>
-          <td class="t-type">{{ r.type }}</td>
-          <td class="t-name">{{ r.name }}</td>
-          <td class="t-size">{{ r.size_bytes | fmt_size }}</td>
-          <td class="t-rec rec-{{ r.recommendation }}">{{ r.recommendation }}</td>
-          <td class="t-conf">
-            {% if r.confidence is not none %}{{ "%.0f%%" | format(r.confidence * 100) }}
-            {% else %}—{% endif %}
-          </td>
-          <td class="t-reason">{{ r.reason }}</td>
-          <td>
-            {% if r.type == "folder" %}
-            <button class="btn btn-open" data-path="{{ r.path }}"
-              onclick="openPath(this)">Open folder</button>
-            {% endif %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% else %}
-    <p style="color:#444; padding: 8px 0;">None</p>
-    {% endif %}
-  </div>
-
-  <div class="actions">
-    <button class="btn btn-confirm" onclick="confirmDeletion()">Confirm Deletion</button>
-    <button class="btn btn-cancel" onclick="cancelDeletion()">Cancel</button>
-    <span id="status"></span>
-  </div>
-
+<!-- ── Group A ───────────────────────────────────────────────────── -->
+<div class="group-a">
+  <h2>Group A — Rule-confirmed Garbage{% if not preview %} (already recycled){% endif %}</h2>
+  {% if group_a %}
+  <table>
+    <thead>
+      <tr>
+        <th class="t-type">Type</th>
+        <th>Name</th>
+        <th class="t-size">Size</th>
+        <th>Rule</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in group_a %}
+      <tr>
+        <td class="t-type">{{ r.type }}</td>
+        <td class="t-name">{{ r.name }}</td>
+        <td class="t-size">{{ r.size_bytes | fmt_size }}</td>
+        <td class="t-reason">{{ r.reason }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color:#444; padding: 8px 0;">None</p>
+  {% endif %}
 </div>
 
-<div id="done-msg"></div>
+<!-- ── Group B ───────────────────────────────────────────────────── -->
+<div class="group-b">
+  <h2>Group B — Needs Human Decision (AI-advised)</h2>
+  {% if group_b %}
+  <table>
+    <thead>
+      <tr>
+        <th class="t-type">Type</th>
+        <th>Name</th>
+        <th class="t-size">Size</th>
+        <th>AI Rec</th>
+        <th class="t-conf">Conf</th>
+        <th>Reason</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in group_b %}
+      <tr id="row-{{ loop.index }}">
+        <td class="t-type">{{ r.type }}</td>
+        <td class="t-name">{{ r.name }}</td>
+        <td class="t-size">{{ r.size_bytes | fmt_size }}</td>
+        <td class="t-rec rec-{{ r.recommendation }}">{{ r.recommendation }}</td>
+        <td class="t-conf">
+          {% if r.confidence is not none %}{{ "%.0f%%" | format(r.confidence * 100) }}
+          {% else %}—{% endif %}
+        </td>
+        <td class="t-reason">{{ r.reason }}</td>
+        <td style="white-space:nowrap">
+          {% if not preview %}
+          <button class="btn btn-delete"
+            data-path="{{ r.path }}" data-row="{{ loop.index }}"
+            onclick="deleteItem(this)">Delete</button>
+          {% endif %}
+          {% if r.type == "folder" %}
+          <button class="btn btn-open" data-path="{{ r.path }}"
+            onclick="openPath(this)">Open</button>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color:#444; padding: 8px 0;">None</p>
+  {% endif %}
+</div>
+
+<div class="actions">
+  {% if preview %}
+  <button class="btn btn-close" onclick="closeUI()">Close Preview</button>
+  {% else %}
+  <button class="btn btn-close" onclick="closeUI()">Done — Close</button>
+  {% endif %}
+  <span id="status"></span>
+</div>
 
 <script>
-const selectAll = document.getElementById("select-all");
-const selectGarbage = document.getElementById("select-garbage");
-
-selectAll?.addEventListener("change", () => {
-  document.querySelectorAll(".row-check").forEach(cb => cb.checked = selectAll.checked);
-  if (selectGarbage) selectGarbage.checked = false;
-});
-
-selectGarbage?.addEventListener("change", () => {
-  document.querySelectorAll(".row-check").forEach(cb => {
-    cb.checked = selectGarbage.checked && cb.dataset.rec === "likely_garbage";
-  });
-  if (selectAll) selectAll.checked = false;
-});
-
 function openPath(btn) {
   const path = btn.dataset.path;
   fetch("/open-path", {
@@ -239,51 +224,43 @@ function openPath(btn) {
   }).catch(console.error);
 }
 
-function confirmDeletion() {
-  const selected = Array.from(document.querySelectorAll(".row-check:checked"))
-    .map(cb => cb.dataset.path);
-  const groupACount = {{ group_a | length }};
-  const total = groupACount + selected.length;
-
+function deleteItem(btn) {
+  const path = btn.dataset.path;
+  const rowId = "row-" + btn.dataset.row;
   if (!confirm(
-    `Send ${total} item(s) to the Recycle Bin?\\n\\n` +
-    `  Group A (rule-confirmed): ${groupACount}\\n` +
-    `  Group B (your selection): ${selected.length}\\n\\n` +
-    `This is reversible — items go to the Recycle Bin, not permanent delete.`
+    "Send to Recycle Bin?\\n\\n" + path +
+    "\\n\\nThis is reversible — you can restore from the Recycle Bin."
   )) return;
-
-  document.getElementById("status").textContent = "Sending to Recycle Bin…";
-  fetch("/confirm", {
+  btn.disabled = true;
+  btn.textContent = "Deleting…";
+  document.getElementById("status").textContent = "";
+  fetch("/delete-item", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ selected })
+    body: JSON.stringify({ path })
   })
   .then(r => r.json())
-  .then(() => {
-    document.getElementById("main-ui").style.display = "none";
-    const msg = document.getElementById("done-msg");
-    msg.className = "done-confirmed";
-    msg.innerHTML = `
-      <strong>Done!</strong> ${total} item(s) sent to the Recycle Bin.<br>
-      <span style="color:#4a9a6a; font-size:0.9em">
-        Undo: open the Recycle Bin and restore items.
-      </span><br><br>
-      <span style="color:#3a6a3a; font-size:0.85em">You can close this tab.</span>`;
-    msg.style.display = "block";
+  .then(data => {
+    if (data.ok) {
+      document.getElementById(rowId).classList.add("deleted");
+      btn.textContent = "Deleted";
+    } else {
+      btn.disabled = false;
+      btn.textContent = "Delete";
+      document.getElementById("status").textContent = "Error: " + data.error;
+    }
   })
   .catch(err => {
+    btn.disabled = false;
+    btn.textContent = "Delete";
     document.getElementById("status").textContent = "Error: " + err;
   });
 }
 
-function cancelDeletion() {
-  fetch("/cancel", { method: "POST" }).catch(console.error);
-  document.getElementById("main-ui").style.display = "none";
-  const msg = document.getElementById("done-msg");
-  msg.className = "done-cancelled";
-  msg.innerHTML = `Cancelled — nothing was deleted.<br>
-    <span style="font-size:0.85em">You can close this tab.</span>`;
-  msg.style.display = "block";
+function closeUI() {
+  fetch("/close", { method: "POST" }).catch(console.error);
+  document.body.innerHTML =
+    '<p style="color:#666; padding:60px; text-align:center; font-size:1.1em">Closed. You can close this tab.</p>';
 }
 </script>
 </body>
@@ -302,63 +279,75 @@ def _fmt_size(n: int) -> str:
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def launch(group_a: list[dict], group_b: list[dict]) -> list[dict]:
+def launch(group_a: list[dict], group_b: list[dict], preview: bool = False) -> None:
     """
-    Start a local Flask server, open the review UI in the default browser,
-    and block until the user confirms or cancels.  Returns the list of
-    confirmed items (Group A + selected Group B), or [] on cancel.
+    Start a local Flask server and open the review UI in the default browser.
+
+    preview=True  (--dry-run): read-only view of Group A + B, nothing deleted.
+    preview=False (regular):   Group A already recycled by caller; Group B rows
+                               each have a per-row Delete button that recycles
+                               immediately. Blocks until user clicks Done/Close.
     """
+    from actions import run_actions
+
     app = Flask(__name__)
     app.jinja_env.filters["fmt_size"] = _fmt_size
 
-    _result: dict = {"confirmed": None}
     _done = threading.Event()
+    _valid_paths: set[str] = {r["path"] for r in group_a + group_b}
 
     @app.route("/")
     def index():
-        return render_template_string(_HTML, group_a=group_a, group_b=group_b)
+        return render_template_string(_HTML, group_a=group_a, group_b=group_b, preview=preview)
 
     @app.route("/open-path", methods=["POST"])
     def open_path():
         path = (request.get_json() or {}).get("path", "")
-        if path and Path(path).exists():
+        if path in _valid_paths and Path(path).exists():
             os.startfile(path)
             return jsonify({"ok": True})
-        return jsonify({"ok": False, "error": "path not found"}), 400
+        return jsonify({"ok": False, "error": "path not in review set or not found"}), 400
 
-    @app.route("/confirm", methods=["POST"])
-    def confirm():
-        data = request.get_json() or {}
-        selected = set(data.get("selected", []))
-        confirmed_b = [r for r in group_b if r["path"] in selected]
-        _result["confirmed"] = group_a + confirmed_b
-        # Delay shutdown so the HTTP response reaches the browser first.
-        threading.Thread(
-            target=lambda: (_delay(0.5), _done.set()), daemon=True
-        ).start()
-        return jsonify({"ok": True})
+    @app.route("/delete-item", methods=["POST"])
+    def delete_item():
+        if preview:
+            return jsonify({"ok": False, "error": "dry-run mode — deletion disabled"}), 403
+        path = (request.get_json() or {}).get("path", "")
+        if path not in _valid_paths:
+            return jsonify({"ok": False, "error": "path not in review set"}), 400
+        item = next((r for r in group_b if r["path"] == path), None)
+        if item is None:
+            return jsonify({"ok": False, "error": "item not found in Group B"}), 404
+        try:
+            run_actions([item], dry_run=False)
+            _log.info("DELETED VIA UI: %s", path)
+            return jsonify({"ok": True})
+        except Exception as exc:
+            _log.error("Failed to delete %s: %s", path, exc)
+            return jsonify({"ok": False, "error": str(exc)}), 500
 
-    @app.route("/cancel", methods=["POST"])
-    def cancel():
-        _result["confirmed"] = []
-        threading.Thread(
-            target=lambda: (_delay(0.5), _done.set()), daemon=True
-        ).start()
+    @app.route("/close", methods=["POST"])
+    def close():
+        threading.Thread(target=lambda: (_delay(0.5), _done.set()), daemon=True).start()
         return jsonify({"ok": True})
 
     import werkzeug.serving
-    server = werkzeug.serving.make_server("127.0.0.1", 5000, app, threaded=True)
+    server = werkzeug.serving.make_server("127.0.0.1", 0, app, threaded=True)
+    actual_port = server.socket.getsockname()[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    url = "http://127.0.0.1:5000"
-    print(f"Web UI: {url}  (waiting for your decision in the browser…)")
+    mode_label = "preview (dry-run)" if preview else "review"
+    url = f"http://127.0.0.1:{actual_port}"
+    print(f"Web UI [{mode_label}]: {url}")
     webbrowser.open(url)
 
-    _done.wait()
-    server.shutdown()
-
-    return _result["confirmed"] or []
+    try:
+        _done.wait()
+    except KeyboardInterrupt:
+        print("\nInterrupted — closing.")
+    finally:
+        server.shutdown()
 
 
 def _delay(seconds: float) -> None:

@@ -66,6 +66,11 @@ def create_fixtures() -> None:
     _write(FIXTURES_DIR / "all_garbage_parent" / "node_modules" / "lib.js")
     _write(FIXTURES_DIR / "all_garbage_parent" / "__pycache__" / "cached.pyc")
 
+    # regression: opaque-named folder with BOTH a garbage subfolder AND a loose non-PDF file
+    # must never receive a 'garbage' verdict — the loose file has no individual evaluation
+    _write(FIXTURES_DIR / "opaque_with_loose_file" / "node_modules" / "lib.js")
+    _write(FIXTURES_DIR / "opaque_with_loose_file" / "readme.txt")
+
     # ── Group B seeds: rules must NOT classify these as garbage ───────────────
 
     _write(FIXTURES_DIR / "active_project" / "main.py")

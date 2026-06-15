@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 load_dotenv()
 
 BATCH_SIZE = 50
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-2.0-flash-lite"
 
 
 # ── Pydantic schema for one AI response row ───────────────────────────────────
@@ -58,6 +58,9 @@ def _build_prompt(batch: list[tuple[str, dict, str]]) -> str:
         "- Base recommendations ONLY on the metadata shown. Do not guess file contents.",
         "- Folder NAME is the strongest signal when it is legible (e.g. node_modules,",
         "  old_backup_2019). Use metadata to disambiguate opaque names (stuff, new folder).",
+        "- When a folder's name is opaque AND its metadata is inconclusive, state plainly",
+        "  in your reason that you cannot determine the folder's purpose from the name alone,",
+        "  and recommend 'likely_keep' so a human makes the call rather than guessing it away.",
         "- Return one result per item using the exact 'path' string given.",
         "",
         "Items:",

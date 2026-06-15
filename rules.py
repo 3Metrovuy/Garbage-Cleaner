@@ -46,11 +46,10 @@ def classify_folders(
 ) -> dict[str, str]:
     """
     Apply deterministic rules to every folder in folder_inventory.
-    Returns path_str -> verdict: 'garbage' | 'keep' | 'skip' | 'unknown'.
+    Returns path_str -> verdict: 'garbage' | 'skip' | 'unknown'.
 
     Processing is bottom-up: folders are sorted by depth descending so that
     when we evaluate a parent, all its children already have verdicts.
-    This lets the 'all-children-are-garbage' rule work in a single pass.
     """
     verdicts: dict[str, str] = {}
 
@@ -80,25 +79,6 @@ def classify_folders(
         # Recognisable regenerable folder (exact name match, case-insensitive)
         if name_lower in REGENERABLE_NAMES:
             verdicts[meta["path"]] = "garbage"
-            continue
-
-        # All direct children already classified as garbage → whole folder is garbage.
-        # We check only direct children (depth == this folder's depth + 1) so we
-        # don't accidentally collapse a parent because of a distant descendant.
-        direct_children = [
-            v for p, v in verdicts.items()
-            if folder_inventory.get(p, {}).get("depth") == meta["depth"] + 1
-            and Path(p).parent == path
-        ]
-        if direct_children and all(v == "garbage" for v in direct_children):
-            verdicts[meta["path"]] = "garbage"
-            continue
-
-        # ── Keep rules ───────────────────────────────────────────────────────
-
-        # If any direct child is kept, the folder is kept too.
-        if any(v == "keep" for v in direct_children):
-            verdicts[meta["path"]] = "keep"
             continue
 
         # Everything else goes to AI for advice

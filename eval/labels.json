@@ -53,9 +53,9 @@
       "note": "regenerable name"
     },
     "all_garbage_parent": {
-      "should_auto_delete": true,
-      "expected_rule_verdict": "garbage",
-      "note": "all subfolder children are garbage — no direct files"
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "opaque name; only garbage subfolders but no all-children rule — must fall through to unknown"
     },
     "all_garbage_parent/node_modules": {
       "should_auto_delete": true,
@@ -106,6 +106,16 @@
       "should_auto_delete": false,
       "expected_rule_verdict": "unknown",
       "note": "PDF container folder — not a regenerable name"
+    },
+    "opaque_with_loose_file": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "regression: opaque name + garbage subfolder (node_modules) + loose non-PDF file — must never auto-delete"
+    },
+    "opaque_with_loose_file/node_modules": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "regenerable name (nested inside regression fixture)"
     }
   },
 
