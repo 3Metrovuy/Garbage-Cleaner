@@ -1,0 +1,149 @@
+{
+  "_comment": "Paths are relative to eval/fixtures/ using forward slashes.",
+
+  "folders": {
+    "empty_folder": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "empty: no files, no subfolders"
+    },
+    "node_modules": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "regenerable name"
+    },
+    "__pycache__": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "regenerable name"
+    },
+    ".cache": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "regenerable name"
+    },
+    "venv": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "regenerable name"
+    },
+    ".venv": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "regenerable name"
+    },
+    "build": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "regenerable name"
+    },
+    "dist": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "regenerable name"
+    },
+    ".mypy_cache": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "regenerable name"
+    },
+    ".pytest_cache": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "regenerable name"
+    },
+    "all_garbage_parent": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "all subfolder children are garbage — no direct files"
+    },
+    "all_garbage_parent/node_modules": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "regenerable name (nested)"
+    },
+    "all_garbage_parent/__pycache__": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "regenerable name (nested)"
+    },
+    "active_project": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "real source code — must never be auto-deleted"
+    },
+    "old_backup_2019": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "opaque date-stamped name — goes to AI, not auto-deleted"
+    },
+    "my_documents": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "user documents — must not be auto-deleted"
+    },
+    "photos_vacation": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "user media — must not be auto-deleted"
+    },
+    "scripts_utils": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "user scripts — must not be auto-deleted"
+    },
+    "project_beta": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "active project with package.json — must not be auto-deleted"
+    },
+    "backup_final": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "ambiguous backup folder — goes to AI, not auto-deleted"
+    },
+    "pdfs": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "PDF container folder — not a regenerable name"
+    }
+  },
+
+  "pdfs": {
+    "pdfs/report_2024.pdf": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "unique PDF — goes to AI"
+    },
+    "pdfs/invoice_march.pdf": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "unique PDF — goes to AI"
+    },
+    "pdfs/manual_v2.pdf": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "unique PDF — goes to AI"
+    },
+    "pdfs/thesis_draft.pdf": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "unique PDF — goes to AI"
+    },
+    "pdfs/dup_original.pdf": {
+      "should_auto_delete": false,
+      "expected_rule_verdict": "unknown",
+      "note": "oldest copy of duplicate set — kept, goes to AI"
+    },
+    "pdfs/dup_copy_1.pdf": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "exact duplicate of dup_original — auto-deleted"
+    },
+    "pdfs/dup_copy_2.pdf": {
+      "should_auto_delete": true,
+      "expected_rule_verdict": "garbage",
+      "note": "exact duplicate of dup_original — auto-deleted"
+    }
+  }
+}
