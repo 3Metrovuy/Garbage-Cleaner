@@ -1,8 +1,9 @@
+from pathlib import Path
+
 from rich import box
 from rich.console import Console
 from rich.table import Table
 
-_REC_ORDER = {"likely_garbage": 0, "needs_review": 1, "likely_keep": 2}
 _REC_STYLE = {"likely_garbage": "red", "likely_keep": "green", "needs_review": "yellow"}
 
 
@@ -14,11 +15,65 @@ def _fmt_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
+def _name_cell(r: dict) -> str:
+    """Indent by nesting depth and mark folders with a trailing '/'."""
+    indent = "  " * r.get("indent", 0)
+    name = r["name"] + "/" if r["type"] == "folder" else r["name"]
+    return f"{indent}{name}"
+
+
+def _hierarchical_order(items: list[dict]) -> list[dict]:
+    """
+    Order items so every subfolder/file sits directly beneath the parent it
+    lives in (when that parent is also present in this group), and siblings are
+    sorted largest-first. Each item gets an "indent" field = its nesting depth
+    relative to the shallowest ancestor present in this group, for display.
+    """
+    by_path = {it["path"]: it for it in items}
+
+    # For each item, find its nearest ancestor that is also in this group.
+    children: dict[str | None, list[dict]] = {}
+    for it in items:
+        parent_key: str | None = None
+        for ancestor in Path(it["path"]).parents:
+            anc = str(ancestor)
+            if anc in by_path:
+                parent_key = anc
+                break
+        children.setdefault(parent_key, []).append(it)
+
+    ordered: list[dict] = []
+
+    def emit(parent_key: str | None, indent: int) -> None:
+        kids = sorted(children.get(parent_key, []), key=lambda r: r["size_bytes"], reverse=True)
+        for kid in kids:
+            kid["indent"] = indent
+            ordered.append(kid)
+            emit(kid["path"], indent + 1)
+
+    emit(None, 0)
+    return ordered
+
+
+def _covered_by_folder(file_path: str, folder_verdicts: dict[str, str]) -> bool:
+    """
+    True if a loose file lives inside a folder that is already accounted for —
+    either auto-garbage (deleted as a unit) or an 'unknown' folder already
+    offered for review on its own. Such files must NOT be listed individually:
+    the folder is the review unit. Files whose only ancestors are 'skip'
+    (the scan target itself, system dirs) ARE genuinely loose and listed.
+    """
+    for ancestor in Path(file_path).parents:
+        if folder_verdicts.get(str(ancestor)) in ("garbage", "unknown"):
+            return True
+    return False
+
+
 def build_report(
     folder_inventory: dict[str, dict],
-    pdf_inventory: dict[str, dict],
+    file_inventory: dict[str, dict],
     folder_verdicts: dict[str, str],
-    pdf_verdicts: dict[str, str],
+    file_verdicts: dict[str, str],
     ai_results: dict[str, dict],
 ) -> tuple[list[dict], list[dict]]:
     """
@@ -57,15 +112,20 @@ def build_report(
                 "reason": ai.get("reason", ""),
             })
 
-    for path_str, meta in pdf_inventory.items():
-        verdict = pdf_verdicts.get(path_str)
+    for path_str, meta in file_inventory.items():
+        verdict = file_verdicts.get(path_str)
+        # Duplicate PDFs are deleted as files even if they live inside a folder;
+        # other loose files are only listed when not covered by a parent folder.
+        if verdict != "garbage" and _covered_by_folder(path_str, folder_verdicts):
+            continue
         size = meta["size_bytes"]
+        ftype = "pdf" if meta.get("ext") == ".pdf" else "file"
         if verdict == "garbage":
             group_a.append({
                 "path": path_str,
                 "name": meta["name"],
                 "size_bytes": size,
-                "type": "pdf",
+                "type": ftype,
                 "reason": "exact duplicate",
             })
         elif verdict == "large":
@@ -73,7 +133,7 @@ def build_report(
                 "path": path_str,
                 "name": meta["name"],
                 "size_bytes": size,
-                "type": "pdf",
+                "type": ftype,
                 "recommendation": "needs_review",
                 "confidence": None,
                 "reason": "file exceeds 1 GB — not evaluated",
@@ -84,14 +144,16 @@ def build_report(
                 "path": path_str,
                 "name": meta["name"],
                 "size_bytes": size,
-                "type": "pdf",
+                "type": ftype,
                 "recommendation": ai.get("recommendation", "needs_review"),
                 "confidence": ai.get("confidence"),
                 "reason": ai.get("reason", ""),
             })
 
-    group_a.sort(key=lambda r: r["size_bytes"], reverse=True)
-    group_b.sort(key=lambda r: _REC_ORDER.get(r["recommendation"], 99))
+    # Sort largest-first, but keep subfolders/files directly under the parent
+    # they live in so the tree reads naturally.
+    group_a = _hierarchical_order(group_a)
+    group_b = _hierarchical_order(group_b)
 
     return group_a, group_b
 
@@ -108,7 +170,7 @@ def display(group_a: list[dict], group_b: list[dict]) -> None:
         tbl.add_column("Size", justify="right")
         tbl.add_column("Rule")
         for r in group_a:
-            tbl.add_row(r["type"], r["name"], _fmt_size(r["size_bytes"]), r["reason"], style="red")
+            tbl.add_row(r["type"], _name_cell(r), _fmt_size(r["size_bytes"]), r["reason"], style="red")
         console.print(tbl)
     else:
         console.print("  [dim]None[/dim]\n")
@@ -126,7 +188,7 @@ def display(group_a: list[dict], group_b: list[dict]) -> None:
             rec = r["recommendation"]
             conf = f"{r['confidence']:.0%}" if r["confidence"] is not None else "—"
             tbl.add_row(
-                r["type"], r["name"], _fmt_size(r["size_bytes"]),
+                r["type"], _name_cell(r), _fmt_size(r["size_bytes"]),
                 rec, conf, r["reason"] or "",
                 style=_REC_STYLE.get(rec, ""),
             )

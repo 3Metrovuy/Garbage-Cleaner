@@ -62,7 +62,11 @@ tr:hover td { background: #161616; }
 tr.deleted td { opacity: 0.35; text-decoration: line-through; }
 
 .t-type { color: #666; font-size: 0.82em; white-space: nowrap; }
-.t-name { font-weight: 500; color: #eee; }
+.t-name { font-weight: 500; color: #eee; white-space: pre; }
+.t-name.is-folder { color: #ffd27f; }
+.t-name .indent { color: #444; }
+.t-check { width: 28px; text-align: center; }
+.t-check input { width: 15px; height: 15px; cursor: pointer; }
 .t-size { font-family: monospace; color: #aaa; white-space: nowrap; text-align: right; }
 .t-reason { color: #777; font-size: 0.85em; max-width: 400px; line-height: 1.4; }
 .t-conf  { font-family: monospace; color: #666; text-align: right; white-space: nowrap; }
@@ -81,12 +85,20 @@ tr.deleted td { opacity: 0.35; text-decoration: line-through; }
   transition: background 0.15s;
 }
 .btn-open:hover { background: #2a2a5a; }
-.btn-delete {
-  background: #3a0000; color: #ff6b6b;
-  transition: background 0.15s; margin-right: 4px;
+
+.topbar {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; gap: 14px;
+  background: #0d0d0d; border-bottom: 1px solid #2a2a2a;
+  padding: 12px 0; margin-bottom: 20px;
 }
-.btn-delete:hover { background: #600000; }
-.btn-delete:disabled { background: #1a3a1a; color: #6bffb0; cursor: default; }
+.btn-confirm {
+  background: #3a0000; color: #ff6b6b; font-size: 0.95em; padding: 9px 20px;
+  transition: background 0.15s;
+}
+.btn-confirm:hover:not(:disabled) { background: #600000; }
+.btn-confirm:disabled { background: #1a1a1a; color: #555; cursor: default; }
+#sel-count { color: #999; font-size: 0.9em; }
 
 .actions {
   display: flex; align-items: center; gap: 12px;
@@ -112,7 +124,8 @@ tr.deleted td { opacity: 0.35; text-decoration: line-through; }
 </div>
 {% else %}
 <div class="banner banner-recycled">
-  Group A: {{ group_a | length }} item(s) ({{ group_a | sum(attribute="size_bytes") | fmt_size }}) already sent to Recycle Bin.
+  Nothing is recycled until you click <strong>Delete selected</strong>.
+  Group A (rule-confirmed) is pre-checked — uncheck anything you want to keep.
 </div>
 {% endif %}
 
@@ -128,13 +141,23 @@ tr.deleted td { opacity: 0.35; text-decoration: line-through; }
   </div>
 </div>
 
+{% if not preview and (group_a or group_b) %}
+<div class="topbar">
+  <button class="btn btn-confirm" id="delete-selected" onclick="deleteSelected()" disabled>
+    Delete selected
+  </button>
+  <span id="sel-count">0 selected</span>
+</div>
+{% endif %}
+
 <!-- ── Group A ───────────────────────────────────────────────────── -->
 <div class="group-a">
-  <h2>Group A — Rule-confirmed Garbage{% if not preview %} (already recycled){% endif %}</h2>
+  <h2>Group A — Rule-confirmed Garbage{% if not preview %} (pre-selected — uncheck to keep){% endif %}</h2>
   {% if group_a %}
   <table>
     <thead>
       <tr>
+        {% if not preview %}<th class="t-check"><input type="checkbox" class="check-all" checked onclick="toggleAll(this)"></th>{% endif %}
         <th class="t-type">Type</th>
         <th>Name</th>
         <th class="t-size">Size</th>
@@ -144,8 +167,13 @@ tr.deleted td { opacity: 0.35; text-decoration: line-through; }
     <tbody>
       {% for r in group_a %}
       <tr>
+        {% if not preview %}
+        <td class="t-check">
+          <input type="checkbox" class="row-check" data-path="{{ r.path }}" checked onchange="updateCount()">
+        </td>
+        {% endif %}
         <td class="t-type">{{ r.type }}</td>
-        <td class="t-name">{{ r.name }}</td>
+        <td class="t-name {% if r.type == 'folder' %}is-folder{% endif %}"><span class="indent">{{ "  " * r.indent }}</span>{{ r.name }}{% if r.type == "folder" %}/{% endif %}</td>
         <td class="t-size">{{ r.size_bytes | fmt_size }}</td>
         <td class="t-reason">{{ r.reason }}</td>
       </tr>
@@ -164,6 +192,7 @@ tr.deleted td { opacity: 0.35; text-decoration: line-through; }
   <table>
     <thead>
       <tr>
+        {% if not preview %}<th class="t-check"><input type="checkbox" class="check-all" onclick="toggleAll(this)"></th>{% endif %}
         <th class="t-type">Type</th>
         <th>Name</th>
         <th class="t-size">Size</th>
@@ -176,8 +205,13 @@ tr.deleted td { opacity: 0.35; text-decoration: line-through; }
     <tbody>
       {% for r in group_b %}
       <tr id="row-{{ loop.index }}">
+        {% if not preview %}
+        <td class="t-check">
+          <input type="checkbox" class="row-check" data-path="{{ r.path }}" onchange="updateCount()">
+        </td>
+        {% endif %}
         <td class="t-type">{{ r.type }}</td>
-        <td class="t-name">{{ r.name }}</td>
+        <td class="t-name {% if r.type == 'folder' %}is-folder{% endif %}"><span class="indent">{{ "  " * r.indent }}</span>{{ r.name }}{% if r.type == "folder" %}/{% endif %}</td>
         <td class="t-size">{{ r.size_bytes | fmt_size }}</td>
         <td class="t-rec rec-{{ r.recommendation }}">{{ r.recommendation }}</td>
         <td class="t-conf">
@@ -186,15 +220,8 @@ tr.deleted td { opacity: 0.35; text-decoration: line-through; }
         </td>
         <td class="t-reason">{{ r.reason }}</td>
         <td style="white-space:nowrap">
-          {% if not preview %}
-          <button class="btn btn-delete"
-            data-path="{{ r.path }}" data-row="{{ loop.index }}"
-            onclick="deleteItem(this)">Delete</button>
-          {% endif %}
-          {% if r.type == "folder" %}
           <button class="btn btn-open" data-path="{{ r.path }}"
             onclick="openPath(this)">Open</button>
-          {% endif %}
         </td>
       </tr>
       {% endfor %}
@@ -224,35 +251,65 @@ function openPath(btn) {
   }).catch(console.error);
 }
 
-function deleteItem(btn) {
-  const path = btn.dataset.path;
-  const rowId = "row-" + btn.dataset.row;
+function checkedBoxes() {
+  return Array.from(document.querySelectorAll(".row-check:checked:not(:disabled)"));
+}
+
+function updateCount() {
+  const n = checkedBoxes().length;
+  const label = document.getElementById("sel-count");
+  const btn = document.getElementById("delete-selected");
+  if (label) label.textContent = n + " selected";
+  if (btn) btn.disabled = n === 0;
+}
+
+function toggleAll(master) {
+  // Toggle only the checkboxes in the same table as this header checkbox.
+  master.closest("table").querySelectorAll(".row-check:not(:disabled)")
+    .forEach(c => { c.checked = master.checked; });
+  updateCount();
+}
+
+function deleteSelected() {
+  const boxes = checkedBoxes();
+  if (boxes.length === 0) return;
+  const paths = boxes.map(c => c.dataset.path);
   if (!confirm(
-    "Send to Recycle Bin?\\n\\n" + path +
-    "\\n\\nThis is reversible — you can restore from the Recycle Bin."
+    "Send " + paths.length + " item(s) to the Recycle Bin?\\n\\n" +
+    "This is reversible — you can restore from the Recycle Bin."
   )) return;
+
+  const btn = document.getElementById("delete-selected");
   btn.disabled = true;
   btn.textContent = "Deleting…";
   document.getElementById("status").textContent = "";
-  fetch("/delete-item", {
+
+  fetch("/delete-items", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path })
+    body: JSON.stringify({ paths })
   })
   .then(r => r.json())
   .then(data => {
+    btn.textContent = "Delete selected";
     if (data.ok) {
-      document.getElementById(rowId).classList.add("deleted");
-      btn.textContent = "Deleted";
+      boxes.forEach(c => {
+        c.checked = false;
+        c.disabled = true;
+        c.closest("tr").classList.add("deleted");
+      });
+      document.querySelectorAll(".check-all").forEach(m => { m.checked = false; });
+      updateCount();
+      document.getElementById("status").textContent =
+        data.recycled + " item(s) sent to Recycle Bin.";
     } else {
       btn.disabled = false;
-      btn.textContent = "Delete";
       document.getElementById("status").textContent = "Error: " + data.error;
     }
   })
   .catch(err => {
+    btn.textContent = "Delete selected";
     btn.disabled = false;
-    btn.textContent = "Delete";
     document.getElementById("status").textContent = "Error: " + err;
   });
 }
@@ -262,6 +319,9 @@ function closeUI() {
   document.body.innerHTML =
     '<p style="color:#666; padding:60px; text-align:center; font-size:1.1em">Closed. You can close this tab.</p>';
 }
+
+// Reflect any pre-checked rows (Group A) in the button/count on first load.
+updateCount();
 </script>
 </body>
 </html>"""
@@ -284,9 +344,12 @@ def launch(group_a: list[dict], group_b: list[dict], preview: bool = False) -> N
     Start a local Flask server and open the review UI in the default browser.
 
     preview=True  (--dry-run): read-only view of Group A + B, nothing deleted.
-    preview=False (regular):   Group A already recycled by caller; Group B rows
-                               each have a per-row Delete button that recycles
-                               immediately. Blocks until user clicks Done/Close.
+    preview=False (regular):   nothing is recycled up front. Both groups show
+                               checkboxes (Group A pre-checked, Group B
+                               unchecked); the single "Delete selected" button
+                               recycles all checked items. Blocks until the user
+                               clicks Done/Close — closing without confirming
+                               deletes nothing. Group A is unaffected by close.
     """
     from actions import run_actions
 
@@ -294,7 +357,8 @@ def launch(group_a: list[dict], group_b: list[dict], preview: bool = False) -> N
     app.jinja_env.filters["fmt_size"] = _fmt_size
 
     _done = threading.Event()
-    _valid_paths: set[str] = {r["path"] for r in group_a + group_b}
+    _by_path: dict[str, dict] = {r["path"]: r for r in group_a + group_b}
+    _valid_paths: set[str] = set(_by_path)
 
     @app.route("/")
     def index():
@@ -303,27 +367,36 @@ def launch(group_a: list[dict], group_b: list[dict], preview: bool = False) -> N
     @app.route("/open-path", methods=["POST"])
     def open_path():
         path = (request.get_json() or {}).get("path", "")
-        if path in _valid_paths and Path(path).exists():
-            os.startfile(path)
+        p = Path(path)
+        if path in _valid_paths and p.exists():
+            # For a loose file, reveal its containing folder rather than
+            # launching the file itself.
+            os.startfile(str(p if p.is_dir() else p.parent))
             return jsonify({"ok": True})
         return jsonify({"ok": False, "error": "path not in review set or not found"}), 400
 
-    @app.route("/delete-item", methods=["POST"])
-    def delete_item():
+    @app.route("/delete-items", methods=["POST"])
+    def delete_items():
         if preview:
             return jsonify({"ok": False, "error": "dry-run mode — deletion disabled"}), 403
-        path = (request.get_json() or {}).get("path", "")
-        if path not in _valid_paths:
-            return jsonify({"ok": False, "error": "path not in review set"}), 400
-        item = next((r for r in group_b if r["path"] == path), None)
-        if item is None:
-            return jsonify({"ok": False, "error": "item not found in Group B"}), 404
+        paths = (request.get_json() or {}).get("paths", [])
+        if not isinstance(paths, list) or not paths:
+            return jsonify({"ok": False, "error": "no paths supplied"}), 400
+
+        items: list[dict] = []
+        for path in paths:
+            item = _by_path.get(path)
+            if item is None:
+                return jsonify({"ok": False, "error": f"path not in review set: {path}"}), 400
+            items.append(item)
+
         try:
-            run_actions([item], dry_run=False)
-            _log.info("DELETED VIA UI: %s", path)
-            return jsonify({"ok": True})
+            run_actions(items, dry_run=False)
+            for it in items:
+                _log.info("DELETED VIA UI: %s", it["path"])
+            return jsonify({"ok": True, "recycled": len(items)})
         except Exception as exc:
-            _log.error("Failed to delete %s: %s", path, exc)
+            _log.error("Failed to delete selection: %s", exc)
             return jsonify({"ok": False, "error": str(exc)}), 500
 
     @app.route("/close", methods=["POST"])

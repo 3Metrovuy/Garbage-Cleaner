@@ -21,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from rules import classify_folders, classify_pdfs  # noqa: E402
+from rules import classify_files, classify_folders  # noqa: E402
 from scanner import scan  # noqa: E402
 
 EVAL_DIR = Path(__file__).resolve().parent
@@ -138,12 +138,12 @@ def run_eval() -> None:
     pdf_labels: dict[str, dict] = labels["pdfs"]
 
     console.print("[bold]Running scanner …[/bold]")
-    folder_inv, pdf_inv = scan(FIXTURES_DIR)
-    console.print(f"  {len(folder_inv)} folder(s), {len(pdf_inv)} PDF(s) found\n")
+    folder_inv, file_inv = scan(FIXTURES_DIR)
+    console.print(f"  {len(folder_inv)} folder(s), {len(file_inv)} file(s) found\n")
 
     console.print("[bold]Running rules layer …[/bold]\n")
     folder_verdicts = classify_folders(folder_inv)
-    pdf_verdicts = classify_pdfs(pdf_inv)
+    file_verdicts = classify_files(file_inv)
 
     # ── Build result rows ─────────────────────────────────────────────────────
 
@@ -165,7 +165,7 @@ def run_eval() -> None:
 
     for rel_path, lbl in pdf_labels.items():
         abs_path = str((FIXTURES_DIR / Path(rel_path)).resolve())
-        got = pdf_verdicts.get(abs_path, "MISSING")
+        got = file_verdicts.get(abs_path, "MISSING")
         expected = lbl["expected_rule_verdict"]
         rows.append({
             "kind": "pdf",

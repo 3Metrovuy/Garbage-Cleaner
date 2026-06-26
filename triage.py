@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal
 
 from dotenv import load_dotenv
@@ -11,7 +12,14 @@ from pydantic import BaseModel, Field
 load_dotenv()
 
 BATCH_SIZE = 50
-MODEL = "gemini-2.0-flash-lite"
+# gemini-2.0-flash-lite has a 0-request free-tier quota on this key, so every
+# call 429s and every item falls through to "needs_review". 2.5-flash is the
+# model named in the project spec and is available on the free tier.
+MODEL = "gemini-2.5-flash"
+# Batches are independent, so we fan them out concurrently instead of waiting
+# for each to finish before starting the next. Capped low enough to stay under
+# the free-tier requests-per-minute limit.
+MAX_WORKERS = 5
 
 
 # ── Pydantic schema for one AI response row ───────────────────────────────────
@@ -39,7 +47,7 @@ def _fmt_size(size_bytes: int) -> str:
 
 def _build_prompt(batch: list[tuple[str, dict, str]]) -> str:
     """
-    batch items are (path_str, metadata_dict, kind) where kind is 'folder' or 'pdf'.
+    batch items are (path_str, metadata_dict, kind) where kind is 'folder' or 'file'.
     Folders are described name-first because the name is the highest-value signal.
     """
     now = time.time()
@@ -81,11 +89,11 @@ def _build_prompt(batch: list[tuple[str, dict, str]]) -> str:
                 f' types=[{types_str}]'
                 f' markers=[{markers_str}]'
             )
-        else:  # pdf
+        else:  # file
             mod_d = int((now - meta["modified_date"]) / 86400)
             cre_d = int((now - meta["created_date"]) / 86400)
             lines.append(
-                f'  [PDF] path="{path_str}" name="{meta["name"]}"'
+                f'  [FILE] path="{path_str}" name="{meta["name"]}"'
                 f' size={_fmt_size(meta["size_bytes"])}'
                 f' modified={mod_d}d_ago created={cre_d}d_ago'
             )
@@ -102,20 +110,65 @@ def _call_once(client: genai.Client, prompt: str) -> _BatchAdvice:
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=_BatchAdvice,
+            # This is a classification task — model "thinking" only adds latency
+            # (and tokens) without improving the verdict, so turn it off.
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         ),
     )
     return _BatchAdvice.model_validate_json(response.text)
+
+
+def _process_batch(
+    client: genai.Client,
+    batch: list[tuple[str, dict, str]],
+    b_idx: int,
+    total_batches: int,
+) -> dict[str, dict]:
+    """Run one batch (with a single retry) and return path -> advice for it."""
+    log = logging.getLogger(__name__)
+    batch_paths = [p for p, _, _ in batch]
+    log.info("Triage batch %d/%d — %d items", b_idx, total_batches, len(batch))
+
+    advice = None
+    for attempt in (1, 2):
+        try:
+            advice = _call_once(client, _build_prompt(batch))
+            break
+        except Exception as exc:
+            if attempt == 1:
+                log.warning("Batch %d failed (%s) — retrying once", b_idx, exc)
+                time.sleep(2)
+            else:
+                log.error("Batch %d failed on retry (%s) — marking needs_review", b_idx, exc)
+
+    if advice is None:
+        return _all_needs_review(batch_paths, "AI advice unavailable after retry")
+
+    returned = {row.path: row for row in advice.results}
+    out: dict[str, dict] = {}
+    for path_str in batch_paths:
+        if path_str in returned:
+            row = returned[path_str]
+            out[path_str] = {
+                "recommendation": row.recommendation,
+                "confidence": row.confidence,
+                "reason": row.reason,
+            }
+        else:
+            log.warning("Model omitted %s — marking needs_review", path_str)
+            out[path_str] = _needs_review_entry("Model did not return advice for this item")
+    return out
 
 
 # ── Public interface ──────────────────────────────────────────────────────────
 
 def triage(
     unknown_folders: dict[str, dict],
-    unknown_pdfs: dict[str, dict],
+    unknown_files: dict[str, dict],
 ) -> dict[str, dict]:
     """
-    Send unknown folders and PDFs to Gemini 2.5 Flash for advisory recommendations.
-    Folders and PDFs are mixed into shared batches of up to 50 items each.
+    Send unknown folders and files to Gemini 2.5 Flash for advisory recommendations.
+    Folders and files are mixed into shared batches of up to 50 items each.
 
     Returns path_str -> {recommendation, confidence, reason} for every input path.
     Possible recommendation values:
@@ -131,56 +184,31 @@ def triage(
     if not api_key:
         log.error("GEMINI_API_KEY not set — all unknowns marked needs_review")
         return _all_needs_review(
-            list(unknown_folders) + list(unknown_pdfs),
+            list(unknown_folders) + list(unknown_files),
             "GEMINI_API_KEY not set",
         )
 
     client = genai.Client(api_key=api_key)
     results: dict[str, dict] = {}
 
-    # Interleave folders and PDFs so neither type dominates any single batch.
+    # Interleave folders and files so neither type dominates any single batch.
     items: list[tuple[str, dict, str]] = (
         [(p, m, "folder") for p, m in unknown_folders.items()]
-        + [(p, m, "pdf") for p, m in unknown_pdfs.items()]
+        + [(p, m, "file") for p, m in unknown_files.items()]
     )
-    total_batches = (len(items) + BATCH_SIZE - 1) // BATCH_SIZE
+    batches = [items[start : start + BATCH_SIZE] for start in range(0, len(items), BATCH_SIZE)]
+    total_batches = len(batches)
 
-    for b_idx, start in enumerate(range(0, len(items), BATCH_SIZE), 1):
-        batch = items[start : start + BATCH_SIZE]
-        batch_paths = [p for p, _, _ in batch]
-        log.info("Triage batch %d/%d — %d items", b_idx, total_batches, len(batch))
-
-        advice = None
-        for attempt in (1, 2):
-            try:
-                advice = _call_once(client, _build_prompt(batch))
-                break
-            except Exception as exc:
-                if attempt == 1:
-                    log.warning("Batch %d failed (%s) — retrying once", b_idx, exc)
-                    time.sleep(2)
-                else:
-                    log.error(
-                        "Batch %d failed on retry (%s) — marking needs_review",
-                        b_idx, exc,
-                    )
-
-        if advice is None:
-            results.update(_all_needs_review(batch_paths, "AI advice unavailable after retry"))
-            continue
-
-        returned = {row.path: row for row in advice.results}
-        for path_str in batch_paths:
-            if path_str in returned:
-                row = returned[path_str]
-                results[path_str] = {
-                    "recommendation": row.recommendation,
-                    "confidence": row.confidence,
-                    "reason": row.reason,
-                }
-            else:
-                log.warning("Model omitted %s — marking needs_review", path_str)
-                results[path_str] = _needs_review_entry("Model did not return advice for this item")
+    # Batches are independent; run them concurrently. A failed batch degrades to
+    # needs_review inside _process_batch, so one bad batch never sinks the run.
+    workers = min(MAX_WORKERS, total_batches)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_process_batch, client, batch, b_idx, total_batches)
+            for b_idx, batch in enumerate(batches, 1)
+        ]
+        for future in as_completed(futures):
+            results.update(future.result())
 
     return results
 

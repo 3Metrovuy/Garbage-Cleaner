@@ -5,7 +5,7 @@ from pathlib import Path
 
 from actions import run_actions
 from review import build_report, display
-from rules import assert_safe_target, classify_folders, classify_pdfs
+from rules import assert_safe_target, classify_files, classify_folders
 from scanner import scan
 from triage import triage
 
@@ -32,31 +32,52 @@ def _fmt_size(size_bytes: int) -> str:
 
 
 def _terminal_ui(group_a: list[dict], group_b: list[dict]) -> list[dict]:
-    """Checkbox prompt over Group B; Group A is always included. Returns confirmed items."""
+    """
+    Single checkbox prompt over both groups. Group A (rule-confirmed) is
+    pre-checked but can be unchecked to keep; Group B is unchecked by default.
+    Nothing is deleted until the user confirms. Returns confirmed items.
+    """
     import questionary
 
-    selected_b: list[dict] = []
+    choices: list = []
+    if group_a:
+        choices.append(questionary.Separator("── Group A — rule-confirmed garbage (pre-selected) ──"))
+        choices += [
+            questionary.Choice(
+                title=f"[rule]  {r['name']}  ({_fmt_size(r['size_bytes'])})",
+                value=r,
+                checked=True,
+            )
+            for r in group_a
+        ]
     if group_b:
-        choices = [
+        choices.append(questionary.Separator("── Group B — needs your decision ──"))
+        choices += [
             questionary.Choice(
                 title=f"[{r['recommendation']}]  {r['name']}  ({_fmt_size(r['size_bytes'])})",
                 value=r,
+                checked=False,
             )
             for r in group_b
         ]
-        selected_b = questionary.checkbox(
-            "Select Group B items to include in deletion (space to toggle, enter to confirm):",
-            choices=choices,
-        ).ask() or []
 
-    confirmed = group_a + selected_b
-    if not confirmed:
+    if not choices:
+        print("Nothing to review — exiting.")
+        return []
+
+    selected = questionary.checkbox(
+        "Select items to recycle (space to toggle, enter to confirm). "
+        "Group A is pre-checked — uncheck anything you want to keep:",
+        choices=choices,
+    ).ask() or []
+
+    if not selected:
         print("Nothing selected — exiting.")
         return []
 
-    print(f"\n{len(group_a)} Group A + {len(selected_b)} Group B item(s) selected.")
+    print(f"\n{len(selected)} item(s) selected for the Recycle Bin.")
     ok = questionary.confirm("Send all confirmed items to the Recycle Bin?").ask()
-    return confirmed if ok else []
+    return selected if ok else []
 
 
 def main() -> None:
@@ -76,35 +97,41 @@ def main() -> None:
 
     # Stage 1 — Scan
     print(f"Scanning {target} ...")
-    folder_inventory, pdf_inventory = scan(target)
-    log.info("Scan complete: %d folders, %d PDFs", len(folder_inventory), len(pdf_inventory))
-    print(f"Found {len(folder_inventory)} folders and {len(pdf_inventory)} PDFs.")
+    folder_inventory, file_inventory = scan(target)
+    log.info("Scan complete: %d folders, %d files", len(folder_inventory), len(file_inventory))
+    print(f"Found {len(folder_inventory)} folders and {len(file_inventory)} files.")
 
     # Stage 2 — Rules
     folder_verdicts = classify_folders(folder_inventory)
-    pdf_verdicts = classify_pdfs(pdf_inventory)
+    file_verdicts = classify_files(file_inventory)
 
     unknown_folders = {p: m for p, m in folder_inventory.items() if folder_verdicts.get(p) == "unknown"}
-    unknown_pdfs = {p: m for p, m in pdf_inventory.items() if pdf_verdicts.get(p) == "unknown"}
+    # Only genuinely-loose files reach the AI: a file inside a garbage or
+    # already-reviewable folder is covered by that folder, not listed on its own.
+    unknown_files = {
+        p: m for p, m in file_inventory.items()
+        if file_verdicts.get(p) == "unknown"
+        and not any(folder_verdicts.get(str(a)) in ("garbage", "unknown") for a in Path(p).parents)
+    }
     log.info(
-        "Rules: %d garbage folders, %d garbage PDFs, %d unknown folders, %d unknown PDFs",
+        "Rules: %d garbage folders, %d garbage files, %d unknown folders, %d unknown files",
         sum(1 for v in folder_verdicts.values() if v == "garbage"),
-        sum(1 for v in pdf_verdicts.values() if v == "garbage"),
+        sum(1 for v in file_verdicts.values() if v == "garbage"),
         len(unknown_folders),
-        len(unknown_pdfs),
+        len(unknown_files),
     )
 
     # Stage 3 — AI triage (unknowns only)
     ai_results: dict[str, dict] = {}
-    if unknown_folders or unknown_pdfs:
-        print(f"Sending {len(unknown_folders)} folders and {len(unknown_pdfs)} PDFs to AI ...")
-        ai_results = triage(unknown_folders, unknown_pdfs)
+    if unknown_folders or unknown_files:
+        print(f"Sending {len(unknown_folders)} folders and {len(unknown_files)} files to AI ...")
+        ai_results = triage(unknown_folders, unknown_files)
         log.info("AI triage complete: %d results", len(ai_results))
 
     # Stage 4 — Report
     group_a, group_b = build_report(
-        folder_inventory, pdf_inventory,
-        folder_verdicts, pdf_verdicts,
+        folder_inventory, file_inventory,
+        folder_verdicts, file_verdicts,
         ai_results,
     )
     log.info("Report: Group A=%d items, Group B=%d items", len(group_a), len(group_b))
@@ -151,15 +178,10 @@ def main() -> None:
         launch(group_a, group_b, preview=True)
         return
 
-    # Regular web mode: auto-recycle Group A now, then open UI for Group B
-    if group_a:
-        print(f"Recycling {len(group_a)} rule-confirmed item(s) ...")
-        for item in group_a:
-            log.info("AUTO-RECYCLED GROUP A: %s", item["path"])
-        run_actions(group_a, dry_run=False)
-
+    # Regular web mode: nothing is recycled up front. Group A is shown
+    # pre-selected and Group B unchecked; the user confirms in the UI, and all
+    # deletions happen there via the "Delete selected" button.
     launch(group_a, group_b, preview=False)
-    # Group B deletions happen per-row inside the web UI server
 
 
 if __name__ == "__main__":

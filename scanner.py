@@ -4,7 +4,7 @@ import os
 from collections import Counter
 from pathlib import Path
 
-LARGE_PDF_THRESHOLD = 1 * 1024 ** 3  # 1 GB
+LARGE_FILE_THRESHOLD = 1 * 1024 ** 3  # 1 GB
 
 # Names that, when found as a direct child of a folder, tell us what that
 # folder "is about".  Checked against both file names and subfolder names.
@@ -21,17 +21,17 @@ def scan(target: Path) -> tuple[dict[str, dict], dict[str, dict]]:
     """
     Walk target and return two inventories:
       folders  — path_str -> folder descriptor (every subdirectory)
-      pdfs     — path_str -> PDF descriptor   (every .pdf file found)
+      files    — path_str -> file descriptor   (every loose file found)
 
     Symlinks are never followed.  Permission errors are logged and skipped.
-    PDF content-hashes are computed only for PDFs that share an identical
-    size (the only ones that can be exact duplicates).
+    Content-hashes are computed only for PDFs that share an identical size
+    (the only items eligible for exact-duplicate auto-deletion).
     """
     log = logging.getLogger(__name__)
     target = target.resolve()
 
     folder_inventory: dict[str, dict] = {}
-    pdf_inventory: dict[str, dict] = {}
+    file_inventory: dict[str, dict] = {}
 
     def _on_error(exc: OSError) -> None:
         log.warning("Skipping inaccessible path: %s", exc)
@@ -75,16 +75,18 @@ def scan(target: Path) -> tuple[dict[str, dict], dict[str, dict]]:
             if fname in MARKERS:
                 markers_found.add(fname)
 
-            # Collect every PDF into its own inventory
-            if ext == ".pdf":
-                pdf_inventory[str(fpath)] = {
-                    "name": fname,
-                    "size_bytes": st.st_size,
-                    "modified_date": st.st_mtime,
-                    "created_date": st.st_ctime,
-                    "content_hash": None,
-                    "is_large": st.st_size > LARGE_PDF_THRESHOLD,
-                }
+            # Collect every loose file into its own inventory.  Whether it is
+            # actually offered for review (vs. covered by a parent folder) is
+            # decided later in build_report.
+            file_inventory[str(fpath)] = {
+                "name": fname,
+                "ext": ext,
+                "size_bytes": st.st_size,
+                "modified_date": st.st_mtime,
+                "created_date": st.st_ctime,
+                "content_hash": None,
+                "is_large": st.st_size > LARGE_FILE_THRESHOLD,
+            }
 
         # Check direct subdirectory names for markers
         for dname in dirnames:
@@ -133,10 +135,11 @@ def scan(target: Path) -> tuple[dict[str, dict], dict[str, dict]]:
         entry.pop("_ext_counter", None)
 
     # ── Hash only PDFs that share an identical size ──
-    # Files with unique sizes cannot be duplicates, so hashing them is wasteful.
+    # Exact-duplicate auto-deletion is restricted to PDFs (see rules.py), and
+    # files with unique sizes cannot be duplicates, so we hash nothing else.
     size_groups: dict[int, list[str]] = {}
-    for path_str, meta in pdf_inventory.items():
-        if not meta["is_large"]:
+    for path_str, meta in file_inventory.items():
+        if meta["ext"] == ".pdf" and not meta["is_large"]:
             size_groups.setdefault(meta["size_bytes"], []).append(path_str)
 
     for paths in size_groups.values():
@@ -144,11 +147,11 @@ def scan(target: Path) -> tuple[dict[str, dict], dict[str, dict]]:
             continue
         for path_str in paths:
             try:
-                pdf_inventory[path_str]["content_hash"] = _hash_file(Path(path_str))
+                file_inventory[path_str]["content_hash"] = _hash_file(Path(path_str))
             except (PermissionError, OSError) as exc:
                 log.warning("Could not hash %s: %s", path_str, exc)
 
-    return folder_inventory, pdf_inventory
+    return folder_inventory, file_inventory
 
 
 def _hash_file(path: Path) -> str:

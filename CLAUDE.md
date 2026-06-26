@@ -2,7 +2,8 @@ Project: AI File & Folder Declutter Tool
 
 A CLI tool that scans a directory and identifies disposable items. It evaluates
 folders as the primary unit (most reclaimable space lives in folders), plus
-loose PDF files, using deterministic rules first and an LLM only for genuinely
+loose files (files not contained in a folder that is itself a review unit),
+using deterministic rules first and an LLM only for genuinely
 ambiguous folders. The LLM is an advisor: it writes reasoning for a human,
 it never deletes anything. The human makes every non-rule decision through a
 review UI. Confirmed items go to the Recycle Bin (reversible), never hard-deleted.
@@ -16,8 +17,12 @@ A --dry-run flag runs the full pipeline, prints the report, and exits without
 opening the deletion UI and without deleting anything.
 The LLM NEVER deletes and NEVER auto-classifies as garbage. It only produces a
 recommendation + written reasoning for a human. Everything the AI touches goes to human review.
-The ONLY items deleted automatically are deterministic-rule hits (e.g. empty folders,
-recognizable regenerable folders). These are trusted; the AI's are not.
+Nothing is deleted up front, not even rule hits. Deterministic-rule hits
+(Group A: empty folders, recognizable regenerable folders, duplicate PDFs) are
+trusted enough to be PRE-SELECTED (checked by default) in the review UI, but
+they are still only recycled when the human clicks "Delete selected" — and the
+human may uncheck any of them to keep it. Closing the UI without confirming
+deletes nothing.
 Rules are decisive single conditions, NOT additive scores. Match → classify; no match → unknown.
 The model must return structured output validated by pydantic. Never trust raw JSON.
 Every run is logged to a timestamped log file (see Logging).
@@ -60,16 +65,22 @@ name, full path, depth, total size (sum of contained files), file count,
 subfolder count, last-modified date, dominant file types inside (extensions
 seen and rough counts), notable markers (presence of .git, package.json,
 node_modules, venv, etc.).
-Loose PDF files — for each .pdf, a descriptor keyed by file path:
-name, size_bytes, modified_date, created_date. PDFs larger than 1 GB are
+Loose files — for EVERY file, a descriptor keyed by file path:
+name, ext, size_bytes, modified_date, created_date. Files larger than 1 GB are
 flagged "large" and are NOT hashed.
-Do NOT hash every PDF. After the walk, among PDFs <= 1 GB, group by identical
-size and compute content-hash (hashlib) ONLY for PDFs sharing a size — these
-are the only possible duplicates.
+Do NOT hash every file. After the walk, among .pdf files <= 1 GB, group by
+identical size and compute content-hash (hashlib) ONLY for PDFs sharing a size.
+Hashing is restricted to PDFs because exact-duplicate AUTO-DELETION is a
+PDF-only rule (see Stage 2); other file types are never auto-deleted, so there
+is no need to hash them.
 
-
-Non-PDF loose files are NOT evaluated individually; they only matter as part of
-their containing folder's roll-up.
+The scanner collects every file, but a file is only OFFERED for review when it
+is genuinely "loose" — see Stage 4. A file inside a folder that is itself a
+review unit (auto-garbage, or an "unknown" folder shown on its own) is covered
+by that folder and is NOT listed individually; it still contributes to that
+folder's size roll-up. In practice this surfaces files sitting directly in the
+scan target (e.g. an un-organized Downloads folder) without dumping the
+internals of every project folder.
 
 Stage 2 — Rules layer (rules.py)
 
@@ -93,9 +104,10 @@ recognizable folder is trusted even though its contents are not inspected.
 There is deliberately NO "every contained item is garbage → the whole folder
 is garbage" rule. A parent is NOT auto-deleted just because its subfolders are
 garbage. Such a parent almost always has an opaque, unrecognizable name (stuff,
-backup_final, new folder (2), myproject) and may ALSO hold loose non-PDF files
-that are never evaluated individually — collapsing it to garbage as a unit
-would silently recycle those files. It must fall through to "unknown" instead.
+backup_final, new folder (2), myproject) and may ALSO hold loose files that are
+not listed individually once the folder is shown as its own review unit —
+collapsing it to garbage as a unit would silently recycle those files. It must
+fall through to "unknown" instead.
 
 
 Folder out-of-scope rule:
@@ -112,19 +124,23 @@ guess. (Because the scanner no longer needs direct-vs-total file counts for any
 rule, the only protection a folder's loose files have is this fall-through —
 so an opaque-named folder must never be auto-deleted.)
 
-PDF rule:
+File rule (rules.py classify_files):
 
 
-A .pdf is NEVER auto-classified as "keep".
-A .pdf is "garbage" (auto, rule-based) ONLY if it is an exact duplicate
-(same size AND same hash); keep the oldest copy, the rest are garbage.
-Every other .pdf → "unknown", passed to Stage 3 (AI advice).
+A file is NEVER auto-classified as "keep".
+A file is "garbage" (auto, rule-based) ONLY if it is an exact-duplicate .pdf
+(same size AND same hash); keep the oldest copy, the rest are garbage. This is
+the ONLY auto-delete path for a file — no non-PDF file is ever auto-deleted,
+because only PDFs are hashed.
+A file > 1 GB → "large" (flagged, not evaluated).
+Every other file → "unknown", passed to Stage 3 (AI advice).
 
 
 Stage 3 — AI advice (triage.py)
 
-Send ONLY the "unknown" folders and "unknown" PDFs (never rule-decided items,
-never "large" items). Batch ~50 descriptors per Gemini API call (Gemini 2.5 Flash).
+Send ONLY the "unknown" folders and "unknown" loose files (never rule-decided
+items, never "large" items, never files covered by a parent review-unit folder).
+Batch ~50 descriptors per Gemini API call (Gemini 2.5 Flash).
 
 For folders, the descriptor leads with the NAME (the highest-value signal when
 legible — node_modules, venv, etc.), and ALWAYS includes metadata to disambiguate
@@ -165,16 +181,23 @@ Default: Flask local web UI (served on localhost) is the primary review interfac
 
 
 Renders Group A and Group B as HTML tables (same data as the rich tables).
-Group B rows each have: a select/checkbox to mark for deletion, and a
-"See directory" button.
-"See directory" hits a Flask endpoint that runs os.startfile(path) SERVER-SIDE,
-opening the folder in the OS file manager. This works only because the server
-is the user's own local machine. The endpoint MUST validate the requested path
-against the set of paths actually present in this review (Group A + Group B)
-and reject anything else — never call os.startfile on an arbitrary client-
-supplied path.
-A "Confirm deletion" button sends all of Group A plus the user-selected Group B
-items to deletion.
+Subfolders/loose files are ordered directly beneath the parent folder they live
+in (indented, largest-first); folders are marked with a trailing "/" and a
+distinct colour so the tree is legible.
+Group B rows each have: a select/checkbox to mark for deletion, and an
+"Open" button.
+"Open" hits a Flask endpoint that runs os.startfile SERVER-SIDE, opening the
+folder (for a loose file, its CONTAINING folder) in the OS file manager. This
+works only because the server is the user's own local machine. The endpoint
+MUST validate the requested path against the set of paths actually present in
+this review (Group A + Group B) and reject anything else — never call
+os.startfile on an arbitrary client-supplied path.
+Both groups have row checkboxes and a per-table select-all: Group A rows are
+pre-checked (rule-confirmed), Group B rows start unchecked. A single "Delete
+selected" button at the top recycles ALL checked items (Group A + Group B) in
+one batch — there is no per-row delete button, and nothing is recycled before
+this click. Unchecking a Group A row keeps it. Closing the UI without clicking
+deletes nothing.
 
 
 Bind the server to an OS-assigned free port (port 0) and read back the actual
@@ -188,7 +211,8 @@ as a cancel — delete nothing, shut the server down cleanly, and return.
 
 
 Fallback (--no-ui): a terminal review using questionary — show the rich tables,
-then a checkbox prompt over Group B for the user to arrow/space-select items.
+then a single checkbox prompt over BOTH groups (Group A pre-checked, Group B
+unchecked) for the user to arrow/space-select, followed by a confirm prompt.
 
 Deletion (actions.py): all confirmed items are sent to the OS Recycle Bin via
 send2trash (reversible). Folders are sent as a whole unit. NEVER hard-delete.

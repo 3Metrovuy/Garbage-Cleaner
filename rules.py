@@ -69,6 +69,13 @@ def classify_folders(
             verdicts[meta["path"]] = "skip"
             continue
 
+        # The scan target itself (depth 0) is the root the user pointed us at,
+        # never a deletion candidate. Skip it so it never shows up in the
+        # review table or gets sent to the AI.
+        if meta["depth"] == 0:
+            verdicts[meta["path"]] = "skip"
+            continue
+
         # ── Garbage rules ────────────────────────────────────────────────────
 
         # Empty folder: no files, no subfolders
@@ -87,24 +94,27 @@ def classify_folders(
     return verdicts
 
 
-# ── PDF rules ─────────────────────────────────────────────────────────────────
+# ── File rules ────────────────────────────────────────────────────────────────
 
-def classify_pdfs(pdf_inventory: dict[str, dict]) -> dict[str, str]:
+def classify_files(file_inventory: dict[str, dict]) -> dict[str, str]:
     """
-    Apply deterministic rules to every PDF.
+    Apply deterministic rules to every loose file.
     Returns path_str -> verdict: 'garbage' | 'large' | 'unknown'.
 
-    A PDF is garbage only if it is an exact duplicate (same size + same hash);
-    the oldest copy (by created_date) is kept, all others are garbage.
-    Every non-duplicate, non-large PDF -> 'unknown' -> AI advice.
-    PDFs are NEVER auto-classified as 'keep'.
+    Auto-delete (garbage) is reserved for exact-duplicate PDFs only: when two
+    or more PDFs share both size and content-hash, the oldest copy (by
+    created_date) is kept and the rest are garbage.  Only PDFs are hashed, so
+    no other file type can ever be auto-classified as garbage here.
+
+    Every file > 1 GB -> 'large' (not evaluated).  Every other file ->
+    'unknown' -> AI advice + human review.  Files are NEVER auto-kept.
     """
     verdicts: dict[str, str] = {}
 
-    # Group PDFs by content hash to find duplicates.
-    # Only PDFs that share a size were hashed, so content_hash may be None.
+    # Group files by content hash to find exact duplicates.
+    # Only same-size PDFs were hashed, so content_hash is None for everything else.
     hash_groups: dict[str, list[str]] = {}
-    for path_str, meta in pdf_inventory.items():
+    for path_str, meta in file_inventory.items():
         h = meta.get("content_hash")
         if h is not None:
             hash_groups.setdefault(h, []).append(path_str)
@@ -115,12 +125,12 @@ def classify_pdfs(pdf_inventory: dict[str, dict]) -> dict[str, str]:
         if len(paths) < 2:
             continue
         # Oldest = smallest created_date timestamp
-        oldest = min(paths, key=lambda p: pdf_inventory[p]["created_date"])
+        oldest = min(paths, key=lambda p: file_inventory[p]["created_date"])
         for p in paths:
             if p != oldest:
                 duplicate_garbage.add(p)
 
-    for path_str, meta in pdf_inventory.items():
+    for path_str, meta in file_inventory.items():
         if meta["is_large"]:
             verdicts[path_str] = "large"
         elif path_str in duplicate_garbage:
